@@ -136,6 +136,12 @@ agora serve --db <path>                     MCP over stdio
 dotnet publish src/AgoraMCP.McpServer -c Release -o publish
 ```
 
+Re-publishing while agents run it: `pwsh -File publish.ps1`. It publishes
+into `releases/<timestamp>/` and points a `publish` junction at it, so running
+servers keep going, new launches get the new build, and nothing is killed.
+Never `taskkill /IM agora.exe`: some clients (OpenCode) do not respawn a dead
+MCP server, so those agents lose the tools until restarted.
+
 Never serve via `dotnet run` — rebuild delay reads as a hung server.
 
 ### Client wiring

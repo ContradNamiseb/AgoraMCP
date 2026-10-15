@@ -1,6 +1,9 @@
 bin/
 obj/
 publish/
+# publish.ps1 turns publish into a junction into versioned releases.
+/publish
+releases/
 .vs/
 *.db
 *.db-wal
