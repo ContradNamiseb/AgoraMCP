@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/AgoraMCP.Core/AgoraMCP.Core.csproj" />
+    <Project Path="src/AgoraMCP.McpServer/AgoraMCP.McpServer.csproj" />
+  </Folder>
+  <Folder Name="/test/">
+    <Project Path="test/AgoraMCP.Tests/AgoraMCP.Tests.csproj" />
+  </Folder>
+</Solution>

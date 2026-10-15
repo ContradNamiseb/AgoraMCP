@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>AgoraMCP.Tests</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <!-- Must track AgoraMCP.McpServer.csproj's own conditional TargetFramework
+         exactly (see that file's comment): a project can't reference another
+         whose TFM it isn't compatible with (NU1201, confirmed live), and
+         McpServer now resolves to a Windows-versioned TFM on Windows. -->
+    <TargetFramework Condition="'$(OS)' == 'Windows_NT'">net10.0-windows10.0.19041.0</TargetFramework>
+    <TargetFramework Condition="'$(OS)' != 'Windows_NT'">net10.0</TargetFramework>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/AgoraMCP.Core/AgoraMCP.Core.csproj" />
+    <ProjectReference Include="../../src/AgoraMCP.McpServer/AgoraMCP.McpServer.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,64 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Agora thread 19/38 (user-directed), Tier 1 native desktop toast: this
+       project targets a Windows-versioned TFM on Windows and plain net10.0
+       everywhere else, chosen by which OS is actually doing the build (not
+       a <TargetFrameworks> list) so `dotnet build` on the user's Ubuntu box
+       never attempts the Windows leg at all. Verified live, not assumed:
+       WindowsNotificationManager.Initialize() threw
+       TypeLoadException('...ToastNotificationManagerCompat...') on plain
+       net10.0 — confirmed root-caused (isolated in a throwaway project,
+       fails on net10.0, succeeds unchanged on
+       net10.0-windows10.0.19041.0) to the WinRT projection support that
+       Microsoft.Toolkit.Uwp.Notifications needs at runtime, which only a
+       Windows-suffixed TFM provides. This is a known, still-open,
+       unfixed-upstream issue in the (archived) DesktopNotifications repo
+       (issues #24 and #27) with no maintainer response; the TFM is the
+       actual fix, not a workaround around a bug in our own code. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>AgoraMCP.McpServer</RootNamespace>
+    <AssemblyName>agora</AssemblyName>
+    <TargetFramework Condition="'$(OS)' == 'Windows_NT'">net10.0-windows10.0.19041.0</TargetFramework>
+    <TargetFramework Condition="'$(OS)' != 'Windows_NT'">net10.0</TargetFramework>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../AgoraMCP.Core/AgoraMCP.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.11" />
+    <PackageReference Include="ModelContextProtocol" Version="2.2.0" />
+  </ItemGroup>
+
+  <!-- Windows leg: native WinRT toast, in-process, no shell exec. Scoped to
+       this TargetFramework specifically (not just "when building on
+       Windows") so the package graph itself makes the OS split visible. -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0-windows10.0.19041.0'">
+    <PackageReference Include="DesktopNotifications" Version="1.3.1" />
+    <PackageReference Include="DesktopNotifications.Windows" Version="1.3.1" />
+    <!-- DesktopNotifications.Windows 1.3.1 pulls a vulnerable
+         System.Drawing.Common 4.7.0 (CVE-2021-24112, RCE processing certain
+         graphics files — Mac/Linux-only in practice, but this leg only
+         builds on Windows anyway, so pin the current patched release
+         regardless rather than reason about whether the platform carve-out
+         applies here). -->
+    <PackageReference Include="System.Drawing.Common" Version="10.0.12" />
+  </ItemGroup>
+
+  <!-- Linux leg: native D-Bus, in-process, no shell exec (no notify-send). -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
+    <PackageReference Include="DesktopNotifications" Version="1.3.1" />
+    <PackageReference Include="DesktopNotifications.FreeDesktop" Version="1.3.1" />
+    <!-- DesktopNotifications.FreeDesktop 1.3.1 (archived, unmaintained) pulls
+         in Tmds.DBus 0.9.1, which carries a known high-severity vulnerability
+         (CVE-2026-39959: a local, same-session-bus peer can spoof signals,
+         exhaust file descriptors, or crash the process via a malformed
+         message). Fixed in 0.92.0+; pinned here to the current release since
+         the archived package won't ever bump its own transitive dependency. -->
+    <PackageReference Include="Tmds.DBus" Version="0.95.1" />
+    <PackageReference Include="Tmds.DBus.Protocol" Version="0.95.1" />
+  </ItemGroup>
+
+</Project>
