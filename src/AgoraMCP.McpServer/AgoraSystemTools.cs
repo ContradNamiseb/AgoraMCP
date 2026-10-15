@@ -28,26 +28,23 @@ public sealed class AgoraSystemTools
 {
     private AgoraSystemTools() { }
 
-    [McpServerTool(Name = "get_active_application_state")]
+    [McpServerTool(Name = "get_active_application_state", ReadOnly = true)]
     [Description("""
-        Inspect the local operating system: which window is currently in the
-        foreground, which process owns it (PID, name, executable path), and when
-        the snapshot was taken. Local telemetry only — nothing is transmitted.
-        Use it to check whether the user is actively looking at a given tool or
-        editor before waiting on them, or to report situational context.
+        The foreground window: title, owning process (pid, name, exe) and
+        capture time. Read-only, local only. Use it to check whether the user
+        is looking at a given app before waiting on them.
         """)]
     public static string GetActiveApplicationState() =>
         ToolResponses.RenderActiveWindow(OsContext.Service.GetActiveWindowDetails());
 
-    [McpServerTool(Name = "list_top_level_windows")]
+    [McpServerTool(Name = "list_top_level_windows", ReadOnly = true)]
     [Description("""
-        Enumerate all visible top-level windows on this machine with their owning
-        process (PID, name, executable path). Local telemetry only. Use it to find
-        which terminal or editor session owns a given window, or to get an overview
-        of what is currently on screen.
+        Visible top-level windows with owning process (pid, name, exe).
+        Read-only, local only. Use it to find which terminal or editor session
+        owns a window.
         """)]
     public static string ListTopLevelWindows(
-        [Description("Only return windows whose title contains this text (case-insensitive). Omit for all.")]
+        [Description("Only windows whose title contains this text, case-insensitive.")]
         string? title_filter = null)
     {
         var filter = title_filter?.Trim() ?? "";

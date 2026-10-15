@@ -53,7 +53,7 @@ public static class ReviewStore
             .Set("$t", threadId)
             .Query(_ => 1).Count > 0;
         if (!threadExists)
-            throw new AgoraException($"review event: thread {threadId} does not exist.");
+            throw ThreadStore.Missing(db, threadId, "review event: ");
         if (actor.Trim().Length == 0)
             throw new AgoraException("review event: every event names its actor.");
         if (!Kinds.Contains(kind))

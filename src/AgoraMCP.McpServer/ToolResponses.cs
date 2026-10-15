@@ -29,7 +29,11 @@ internal static class ToolResponses
                $"status {t.Status}, updated {ShortTime(t.UpdatedAt)}";
     }
 
-    public static string RenderDetail(ThreadDetail d, bool truncated = false)
+    public static string RenderDetail(ThreadDetail d, bool truncated = false, int maxChars = 0) =>
+        RenderDetail(d, truncated, maxChars, out _);
+
+    /// <summary>As above; <paramref name="shown"/> is how many messages fit the budget.</summary>
+    public static string RenderDetail(ThreadDetail d, bool truncated, int maxChars, out int shown)
     {
         var h = d.Header;
         var lines = new List<string>
@@ -41,13 +45,71 @@ internal static class ToolResponses
         };
         if (h.Context.Length > 0) lines.Add($"context: {h.Context}");
         lines.Add($"messages ({d.Messages.Count}):");
-        lines.AddRange(d.Messages.Select(MessageBlock));
+        var used = lines.Sum(l => l.Length + 1);
+        lines.AddRange(Budgeted(d.Messages, maxChars > 0 ? Math.Max(maxChars - used, 1) : 0, out shown));
         // Canonical history is never lost to a window: the truncation note
         // names the full-history path explicitly (thread #23 stage 5).
         if (truncated)
             lines.Add($"… older messages exist — this was an incremental window. " +
                       "The canonical full history is available via read_thread without since_id/limit.");
         return string.Join('\n', lines);
+    }
+
+    /// <summary>
+    /// Message blocks in order until <paramref name="maxChars"/> runs out (0 =
+    /// no cap). What did not fit is named by id, with the cursor that resumes
+    /// exactly where this stopped — a cut the caller can see past, never a
+    /// silent one. A single message larger than the whole budget is shown cut
+    /// rather than skipped, so every call makes progress.
+    /// </summary>
+    public static List<string> Budgeted(IReadOnlyList<ThreadMessage> messages, int maxChars) =>
+        Budgeted(messages, maxChars, out _);
+
+    /// <summary>As above; <paramref name="shown"/> counts messages shown whole or cut.</summary>
+    public static List<string> Budgeted(IReadOnlyList<ThreadMessage> messages, int maxChars, out int shown)
+    {
+        var blocks = new List<string>();
+        var used = 0;
+        shown = messages.Count;
+        for (var i = 0; i < messages.Count; i++)
+        {
+            var block = MessageBlock(messages[i]);
+            if (maxChars <= 0 || used + block.Length + 1 <= maxChars)
+            {
+                blocks.Add(block);
+                used += block.Length + 1;
+                continue;
+            }
+
+            if (blocks.Count == 0)
+            {
+                var room = Math.Max(maxChars - 120, 200);
+                blocks.Add(block[..Math.Min(room, block.Length)] +
+                           $" …[message cut at {room} of {block.Length} chars; full text: read_thread " +
+                           $"since_id={messages[i].Id - 1} limit=1 max_chars=0]");
+                i++;
+            }
+
+            shown = i;
+            var rest = messages.Skip(i).ToList();
+            if (rest.Count > 0)
+            {
+                var resume = messages[i - 1].Id;
+                blocks.Add($"… max_chars reached: {rest.Count} more message(s) not shown " +
+                           $"({IdList(rest.Select(m => m.Id))}). Continue with since_id={resume}.");
+            }
+            break;
+        }
+        return blocks;
+    }
+
+    /// <summary>"#901 #903 #904 … #940 (+31)" — enough ids to act on, bounded in size.</summary>
+    public static string IdList(IEnumerable<long> ids, int show = 12)
+    {
+        var all = ids.ToList();
+        if (all.Count <= show) return string.Join(' ', all.Select(i => $"#{i}"));
+        return string.Join(' ', all.Take(show - 1).Select(i => $"#{i}")) +
+               $" … #{all[^1]} (+{all.Count - show + 1} more)";
     }
 
     /// <summary>
@@ -74,7 +136,8 @@ internal static class ToolResponses
     /// an instruction to the reader.
     /// </summary>
     public static string RenderBriefing(SqliteConnection db, long threadId,
-        string agent, long sinceId, int recentLimit, MessageCache? cache, bool useDigest = true)
+        string agent, long sinceId, int recentLimit, MessageCache? cache, bool useDigest = true,
+        int maxChars = 0)
     {
         var detail = ThreadStore.ReadThread(db, threadId, cache);
         var h = detail.Header;
@@ -162,8 +225,22 @@ internal static class ToolResponses
             lines.Add(digest is null
                 ? "  (no messages past the given cursor)"
                 : "  (nothing past the digest — it covers the thread to date)");
-        lines.AddRange(window.Select(MessageBlock));
+        var used = lines.Sum(l => l.Length + 1);
+        lines.AddRange(Budgeted(window, maxChars > 0 ? Math.Max(maxChars - used, 1) : 0));
         return string.Join('\n', lines);
+    }
+
+    /// <summary>
+    /// A trailing warning when a recipient has never been seen here — the
+    /// usual cause is a model name used in place of the client name. Advisory,
+    /// not a refusal: an agent may legitimately receive work before its first
+    /// heartbeat, but nobody should send it there by accident.
+    /// </summary>
+    public static string UnknownAgentNote(SqliteConnection db, string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name) || BoardHints.IsKnownAgent(db, name)) return "";
+        return $"\n(warning: '{name.Trim()}' has never been seen on this board — if that is a typo, " +
+               $"known agents are: {string.Join(", ", BoardHints.KnownAgents(db))})";
     }
 
     private static string MessageBlock(ThreadMessage m) =>
@@ -247,11 +324,23 @@ internal static class ToolResponses
         return string.Join('\n', lines);
     }
 
-    public static string RenderHits(IReadOnlyList<SearchHit> hits)
+    public static string RenderHits(IReadOnlyList<SearchHit> hits, int maxChars = 0)
     {
         if (hits.Count == 0) return "no matches.";
         var lines = new List<string> { $"matches: {hits.Count} (best first)" };
-        lines.AddRange(hits.Select(h => ThreadLine(h.Thread) + "\n    …" + h.Snippet.Replace("\n", " ")));
+        var used = lines[0].Length;
+        for (var i = 0; i < hits.Count; i++)
+        {
+            var line = ThreadLine(hits[i].Thread) + "\n    …" + hits[i].Snippet.Replace("\n", " ");
+            if (maxChars > 0 && used + line.Length + 1 > maxChars && i > 0)
+            {
+                lines.Add($"… max_chars={maxChars} reached: {hits.Count - i} more match(es): " +
+                          string.Join(' ', hits.Skip(i).Select(h => $"#{h.Thread.Id}")));
+                break;
+            }
+            lines.Add(line);
+            used += line.Length + 1;
+        }
         return string.Join('\n', lines);
     }
 

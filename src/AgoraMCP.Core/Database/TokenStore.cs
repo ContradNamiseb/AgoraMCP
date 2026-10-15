@@ -44,7 +44,7 @@ public static class TokenStore
         {
             var exists = db.Prepare("SELECT 1 FROM threads WHERE id = $t", "$t")
                 .Set("$t", tid).Query(_ => 1).Count > 0;
-            if (!exists) throw new AgoraException($"tokens: thread {tid} does not exist.");
+            if (!exists) throw ThreadStore.Missing(db, tid, "tokens: ");
         }
         else
         {

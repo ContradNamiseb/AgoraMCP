@@ -47,7 +47,7 @@ public static class AnswerCacheStore
         {
             var exists = db.Prepare("SELECT 1 FROM threads WHERE id = $t", "$t")
                 .Set("$t", tid).Query(_ => 1).Count > 0;
-            if (!exists) throw new AgoraException($"memo: source thread {tid} does not exist.");
+            if (!exists) throw ThreadStore.Missing(db, tid, "memo: source ");
         }
         else
         {

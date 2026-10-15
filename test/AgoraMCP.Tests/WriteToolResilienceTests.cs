@@ -90,20 +90,21 @@ public sealed class WriteToolResilienceTests
         using var client = new McpStdioClient(temp.DbPath, agentEnv: "claude-opus");
 
         // Each call omits the identity parameter exactly as the failing
-        // production calls did (reply{thread_id, body}, pass_turn{thread_id,
-        // to_agent, instruction}, submit_revision{thread_id, revision}).
-        var reply = client.CallTool("reply", new { thread_id = thread, body = "reply without author" });
+        // production calls did (a post {thread_id, body}, a turn pass
+        // {thread_id, to, instruction}, submit_revision{thread_id, revision});
+        // posts and passes now go through respond.
+        var reply = client.CallTool("respond", new { thread_id = thread, body = "reply without author" });
         Assert.False(reply.IsError, reply.Text);
-        Assert.Contains("reply #", reply.Text);
+        Assert.Contains("posted reply #", reply.Text);
 
-        var turn = client.CallTool("pass_turn", new
+        var turn = client.CallTool("respond", new
         {
             thread_id = thread,
-            to_agent = "codex-sol",
+            pass_to = "codex-sol",
             instruction = "re-review please",
         });
         Assert.False(turn.IsError, turn.Text);
-        Assert.Contains("passed to codex-sol by claude-opus", turn.Text);
+        Assert.Contains("by claude-opus: turn → codex-sol", turn.Text);
 
         var revision = client.CallTool("submit_revision", new
         {
@@ -135,18 +136,19 @@ public sealed class WriteToolResilienceTests
 
         using var client = new McpStdioClient(temp.DbPath, agentEnv: null);
 
-        var reply = client.CallTool("reply", new { thread_id = thread, body = "no author anywhere" });
+        var reply = client.CallTool("respond", new { thread_id = thread, body = "no author anywhere" });
         Assert.Contains("Error:", reply.Text);
         Assert.Contains("needs an author", reply.Text);
 
-        var turn = client.CallTool("pass_turn", new
+        var turn = client.CallTool("respond", new
         {
             thread_id = thread,
-            to_agent = "codex-sol",
+            pass_to = "codex-sol",
             instruction = "re-review please",
         });
         Assert.Contains("Error:", turn.Text);
-        Assert.Contains("names the passing agent", turn.Text);
+        Assert.Contains("needs an author", turn.Text);
+        Assert.Contains("Nothing was written", turn.Text);
 
         var revision = client.CallTool("submit_revision", new
         {

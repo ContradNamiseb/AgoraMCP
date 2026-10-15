@@ -20,11 +20,12 @@ public sealed class ResourceToolsTests
 
         var tools = client.ListTools();
 
-        // The total pins the whole surface: 16 collaboration + 2 OS + 8
-        // token-saving + 2 DM + 2 chat tools.
-        Assert.Equal(30, tools.Count);
+        // The total pins the whole surface: 12 collaboration + 2 OS + 8
+        // token-saving + 2 DM + 2 chat + 2 workflow tools. reply,
+        // submit_peer_review, record_review and pass_turn were folded into respond.
+        Assert.Equal(28, tools.Count);
         foreach (var name in new[]
-                 { "send_dm", "read_inbox", "list_chats", "read_chat", "heartbeat" })
+                 { "send_dm", "read_inbox", "list_chats", "read_chat", "heartbeat", "respond", "search_threads" })
             Assert.Contains(name, tools);
     }
 

@@ -248,6 +248,6 @@ public static class TurnStore
             .Set("$t", threadId)
             .Query(_ => 1).Count > 0;
         if (!exists)
-            throw new AgoraException($"turn: thread {threadId} does not exist.");
+            throw ThreadStore.Missing(db, threadId, "turn: ");
     }
 }

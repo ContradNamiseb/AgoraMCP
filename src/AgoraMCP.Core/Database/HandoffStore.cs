@@ -71,7 +71,7 @@ public static class HandoffStore
         cmd.SetAll(claimant.Trim(), AgoraDatabase.Now(), handoffId);
         if (cmd.ExecuteNonQuery() == 0)
             throw new AgoraException(
-                $"handoff {handoffId} is not open for claiming — {DescribeBlocker(db, handoffId)}.");
+                $"handoff {handoffId} is not open for claiming — {DescribeBlocker(db, handoffId)}");
         return Get(db, handoffId);
     }
 
@@ -131,7 +131,8 @@ public static class HandoffStore
            .Query(Read)
            .FirstOrDefault();
         if (entry is null)
-            throw new AgoraException($"handoff {handoffId} does not exist.");
+            throw new AgoraException(
+                $"handoff {handoffId} does not exist. Valid handoff ids — {BoardHints.HandoffIds(db)}.");
         return entry;
     }
 
@@ -152,7 +153,7 @@ public static class HandoffStore
             .Set("$t", threadId)
             .Query(_ => 1).Count > 0;
         if (!exists)
-            throw new AgoraException($"handoff: thread {threadId} does not exist.");
+            throw ThreadStore.Missing(db, threadId, "handoff: ");
     }
 
     private static long LastId(SqliteConnection db) =>

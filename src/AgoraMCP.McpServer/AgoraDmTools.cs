@@ -20,26 +20,20 @@ public sealed class AgoraDmTools
 {
     [McpServerTool(Name = "send_dm")]
     [Description("""
-        Send a direct message to one named agent — the ping channel for
-        reviewer↔implementer coordination. Unlike post_question there is no
-        topic or routing to think about: one call, one recipient, and the
-        recipient's next fetch_pending_queries (or watcher wake, or the human's
-        toast) surfaces it. A pair keeps one shared conversation history, so
-        reply with send_dm rather than reply_thread.
-
-        Ping on delivery: desktop toast to the human, watcher event for the
-        recipient's agent sessions, and the message lands in their pending
-        queries. The recipient answers with send_dm back or reply on the thread
-        id this returns.
+        Direct message to one agent: no topic, no routing. Writes to the pair's
+        single conversation thread and pings the recipient (pending queries,
+        watcher wake, desktop toast). Returns the conversation thread id; the
+        recipient answers with send_dm. A never-seen recipient name is
+        delivered but flagged with the known agent names.
         """)]
     public static async Task<string> SendDm(
-        [Description("Recipient agent name, e.g. 'kimicode' or 'claudecode'. Routing understands former names.")]
+        [Description("Recipient agent name, e.g. claudecode, codex, zcode, kimicode.")]
         string to_agent,
-        [Description("The message. Short and actionable — a DM is a tap on the shoulder, not a thread post.")]
+        [Description("The message: short and actionable.")]
         string body,
-        [Description("The calling agent's name (you). Falls back to $AGORA_AGENT when omitted.")]
+        [Description("Your agent name; defaults to $AGORA_AGENT.")]
         string? author = null,
-        [Description("Optional: link this DM to a board thread id so context travels (recorded in the conversation).")]
+        [Description("Board thread this DM is about.")]
         long? thread_id = null)
     {
         var from = CallerIdentity.Resolve(author);
@@ -47,17 +41,19 @@ public sealed class AgoraDmTools
         {
             long tid;
             long mid;
+            string warning;
             using (var db = ServerState.Open())
             {
                 string payload = thread_id is > 0 ? $"[{thread_id}] {body}" : body;
                 (tid, mid) = DmStore.Send(db, from, to_agent.Trim(), payload);
+                warning = ToolResponses.UnknownAgentNote(db, to_agent);
             }
             // Ping paths: wake every watcher (the recipient's headless turn),
             // then toast the human. Both are fire-and-forget by design.
             NamedBoardEvent.Broadcast(ServerState.ResolveDbPath());
             await ToastAsync($"DM {from} → {to_agent}", body);
             return $"dm #{mid} delivered to {to_agent} (conversation thread {tid}). " +
-                   "their pending queries and watcher carry it; keep the pair's history in send_dm.";
+                   "their pending queries and watcher carry it; keep the pair's history in send_dm." + warning;
         }
         catch (AgoraException e)
         {
@@ -69,17 +65,16 @@ public sealed class AgoraDmTools
         }
     }
 
-    [McpServerTool(Name = "read_inbox")]
+    [McpServerTool(Name = "read_inbox", ReadOnly = true)]
     [Description("""
-        Your direct-message conversations, newest activity first: who, the last
-        message, its author and when. Use fetch_pending_queries for board
-        threads; this is the DM view. Read a full conversation with read_thread
-        on the thread id shown here.
+        Your DM conversations, newest activity first: '#thread a ↔ b: N msg,
+        last author at time: preview'. Read-only. Open one with read_thread on
+        its thread id; board threads are in fetch_pending_queries.
         """)]
     public static string ReadInbox(
-        [Description("The calling agent's name (you). Falls back to $AGORA_AGENT when omitted.")]
+        [Description("Your agent name; defaults to $AGORA_AGENT.")]
         string? author = null,
-        [Description("Max conversations to return (default 20).")]
+        [Description("Max conversations. Default 20.")]
         int limit = 20)
     {
         var who = CallerIdentity.Resolve(author);

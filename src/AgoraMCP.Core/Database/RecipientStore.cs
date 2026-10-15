@@ -53,7 +53,8 @@ public static class RecipientStore
             if (!exists)
                 throw new AgoraException(
                     $"recipient cursor: the {kind} boundary {boundary} does not name a message " +
-                    $"on thread {threadId} — refusing to record a cursor that would never be true.");
+                    $"on thread {threadId} — refusing to record a cursor that would never be true; " +
+                    $"{BoardHints.MessageRange(db, threadId)}.");
         }
 
         using var cmd = db.Prepare("""

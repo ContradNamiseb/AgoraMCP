@@ -105,6 +105,8 @@ internal static class StdioServer
             .WithTools<AgoraSystemTools>()
             .WithTools<AgoraDmTools>()
             .WithTools<AgoraChatTools>()
+            .WithTools<AgoraWorkflowTools>()
+            .WithArgumentGuard()
             .WithResources<AgoraResources>();
         ResourceSubscriptions.Wire(mcp);
 

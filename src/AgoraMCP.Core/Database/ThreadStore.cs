@@ -169,8 +169,7 @@ public static class ThreadStore
             .Query(ReadHeader)
             .FirstOrDefault();
 
-        if (header is null)
-            throw new AgoraException($"thread {threadId} does not exist. Use fetch_pending_queries or list_threads for valid ids.");
+        if (header is null) throw Missing(db, threadId);
 
         // Ids only — the payload decision (memory vs database) is per message.
         var ids = db.Prepare("SELECT id FROM messages WHERE thread_id = $id ORDER BY id", "$id")
@@ -247,6 +246,35 @@ public static class ThreadStore
     private static string FtsQuery(string query, string op) => string.Join(op,
         query.Split([' ', '\t', '\n'], StringSplitOptions.RemoveEmptyEntries)
             .Select(t => $"\"{t.Replace("\"", "\"\"")}\""));
+
+    /// <summary>
+    /// Move a thread to open, answered or closed. Closing ends the review, not
+    /// the record: a closed thread still takes replies and stays readable.
+    /// Returns the status it had before, so the caller can report the move.
+    /// </summary>
+    public static string SetStatus(SqliteConnection db, long threadId, string status)
+    {
+        status = (status ?? "").Trim().ToLowerInvariant();
+        if (status is not (StatusOpen or StatusAnswered or StatusClosed))
+            throw new AgoraException(
+                $"unknown thread status '{status}'. Use one of: {StatusOpen}, {StatusAnswered}, {StatusClosed}.");
+
+        var before = db.Prepare("SELECT status FROM threads WHERE id = $id", "$id")
+            .Set("$id", threadId)
+            .Query(r => r.GetString("status"))
+            .FirstOrDefault();
+        if (before is null) throw Missing(db, threadId);
+
+        db.Prepare("UPDATE threads SET status = $status, updated_at = $now WHERE id = $id",
+                "$status", "$now", "$id")
+            .SetAll(status, AgoraDatabase.Now(), threadId)
+            .ExecuteNonQuery();
+        return before;
+    }
+
+    /// <summary>The refusal for an unknown thread id, naming the ids that do exist.</summary>
+    public static AgoraException Missing(SqliteConnection db, long threadId, string prefix = "") =>
+        new($"{prefix}thread {threadId} does not exist. Valid ids — {BoardHints.ThreadIds(db)}.");
 
     // ---- bounded wait (post_question with wait=true) ----
 
@@ -387,8 +415,7 @@ public static class ThreadStore
             .Query(r => r.GetString("status"))
             .FirstOrDefault();
 
-        if (threadStatus is null)
-            throw new AgoraException($"thread {threadId} does not exist. Use fetch_pending_queries or list_threads for valid ids.");
+        if (threadStatus is null) throw Missing(db, threadId);
         if (kind == "review" && threadStatus == StatusClosed)
             throw new AgoraException($"thread {threadId} is closed — closed threads take reply, not review.");
 

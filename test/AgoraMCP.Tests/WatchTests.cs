@@ -2247,11 +2247,13 @@ public sealed class OsContextTests
         Assert.Contains("read_inbox", names);
         Assert.Contains("list_chats", names);
         Assert.Contains("read_chat", names);
-        // 16 collaboration tools + 2 OS tools + 8 token-saving tools (digests,
-        // notes, memos, ledger) + 2 DM tools. Pins the real total; bump it when
-        // the surface changes, because an unregistered tool is invisible to
-        // every client.
-        Assert.Equal(30, names.Count);
+        // 12 collaboration tools + 2 OS tools + 8 token-saving tools (digests,
+        // notes, memos, ledger) + 2 DM tools + 2 chat tools + 2 workflow tools
+        // (respond, search_threads; respond replaced reply, submit_peer_review,
+        // record_review and pass_turn). Pins the real total; bump it when the
+        // surface changes, because an unregistered tool is invisible to every
+        // client.
+        Assert.Equal(28, names.Count);
     }
 
     [Fact]

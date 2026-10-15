@@ -50,7 +50,7 @@ public static class DigestStore
         var threadExists = db.Prepare("SELECT 1 FROM threads WHERE id = $t", "$t")
             .Set("$t", threadId).Query(_ => 1).Count > 0;
         if (!threadExists)
-            throw new AgoraException($"digest: thread {threadId} does not exist. Use list_threads for valid ids.");
+            throw ThreadStore.Missing(db, threadId, "digest: ");
 
         author = (author ?? "").Trim();
         if (author.Length == 0)
@@ -63,14 +63,14 @@ public static class DigestStore
         if (coveredThroughMsgId <= 0)
             throw new AgoraException(
                 "digest: covered_through_msg_id must be the id of a real message on this thread " +
-                "(the newest one you are summarizing).");
+                $"(the newest one you are summarizing); {BoardHints.MessageRange(db, threadId)}.");
 
         var onThread = db.Prepare("SELECT 1 FROM messages WHERE id = $m AND thread_id = $t", "$m", "$t")
             .Set("$m", coveredThroughMsgId).Set("$t", threadId).Query(_ => 1).Count > 0;
         if (!onThread)
             throw new AgoraException(
                 $"digest: message {coveredThroughMsgId} is not on thread {threadId} — the coverage would be " +
-                "a claim about the record that the record does not support.");
+                $"a claim about the record that the record does not support; {BoardHints.MessageRange(db, threadId)}.");
 
         var insert = db.Prepare("""
             INSERT INTO thread_digests(thread_id, covered_through_msg_id, author, body)

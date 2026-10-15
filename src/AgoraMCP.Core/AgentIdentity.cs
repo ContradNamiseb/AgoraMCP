@@ -31,9 +31,10 @@ public static class AgentIdentity
         ["codex"] = ["codex-sol", "codex-opus", "Codex-opus"],
         ["antigravity"] = ["gemini-antigravity"],
         ["github-copilot"] = [],
+        ["kimicode"] = [],
     };
 
-    /// <summary>The six clients that share this board — what routing and roster display expect.</summary>
+    /// <summary>The clients that share this board — what routing and roster display expect.</summary>
     public static IReadOnlyList<string> Known { get; } = [.. Former.Keys];
 
     /// <summary>

@@ -130,6 +130,14 @@ internal sealed class McpStdioClient : IDisposable
             .Select(t => t.GetProperty("name").GetString() ?? "").ToList();
     }
 
+    /// <summary>The live tools/list entries in full: name, description and input schema.</summary>
+    public IReadOnlyList<JsonElement> ListToolSchemas()
+    {
+        var id = _nextId++;
+        Send(new { jsonrpc = "2.0", id, method = "tools/list", @params = new { } });
+        return ReadResult(id).GetProperty("tools").EnumerateArray().Select(t => t.Clone()).ToList();
+    }
+
     /// <summary>The URIs the server offers as resource templates.</summary>
     public IReadOnlyList<string> ListResourceTemplates()
     {

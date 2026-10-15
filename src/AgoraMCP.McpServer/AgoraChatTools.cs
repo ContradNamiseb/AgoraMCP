@@ -15,24 +15,22 @@ namespace AgoraMCP.McpServer;
 [McpServerToolType]
 public sealed class AgoraChatTools
 {
-    [McpServerTool(Name = "list_chats")]
+    [McpServerTool(Name = "list_chats", ReadOnly = true)]
     [Description("""
-        List the newest chat sessions of every client on this machine —
-        claudecode, zcode, kimicode, codex — newest activity first. Use this to
-        see what the other agents are working on in their own sessions, then
-        read_chat for the conversation. Turn counts: claudecode counts user +
-        assistant turns; others show '-' until read.
+        Newest chat sessions of each client on this machine, to see what other
+        agents are working on: 'client session_id model last turns'. Read-only.
+        Open one with read_chat. Turns show '-' for non-claudecode clients.
         """)]
     public static string ListChats(
-        [Description("Only one client's sessions (claudecode, zcode, kimicode, codex). Omit for all.")]
-        string? client = null,
-        [Description("Max sessions per client (default 5).")]
+        [Description("Only this client's sessions.")]
+        ChatClient? client = null,
+        [Description("Max sessions per client. Default 5.")]
         int per_client = 5)
     {
         var sessions = ChatReaders.ListSessions(perClient: Math.Clamp(per_client, 1, 20));
-        if (!string.IsNullOrWhiteSpace(client))
+        if (client is { } c)
         {
-            var wanted = client.Trim().ToLowerInvariant();
+            var wanted = c.Wire();
             sessions = sessions.Where(s => s.Client.Contains(wanted, StringComparison.Ordinal)).ToList();
         }
         if (sessions.Count == 0)
@@ -42,23 +40,23 @@ public sealed class AgoraChatTools
         return "chat sessions (newest first):\n" + string.Join("\n", lines);
     }
 
-    [McpServerTool(Name = "read_chat")]
+    [McpServerTool(Name = "read_chat", ReadOnly = true)]
     [Description("""
-        Read one chat session of another client (or your own) — the user and
-        assistant text turns, tool traffic skipped. Get the session id from
-        list_chats. Roles are as each client logged them. Read-only.
+        The user and assistant text turns of one chat session (tool traffic
+        skipped), newest last, each cut to 160 chars: 'time role text'.
+        Read-only. Unknown session id → error listing that client's newest ids.
         """)]
     public static string ReadChat(
-        [Description("Client that owns the session: claudecode, zcode, kimicode or codex.")]
-        string client,
+        [Description("Client that owns the session.")]
+        ChatClient client,
         [Description("Session id from list_chats.")]
         string session_id,
-        [Description("Max turns to return, from the end of the conversation (default 30).")]
+        [Description("Max turns, from the end. Default 30.")]
         int last = 30)
     {
         try
         {
-            var turns = ChatReaders.Read(client, session_id);
+            var turns = ChatReaders.Read(client.Wire(), session_id);
             if (turns.Count == 0)
                 return $"session '{session_id}' has no readable user/assistant turns.";
             var take = Math.Clamp(last, 1, 200);
@@ -71,7 +69,13 @@ public sealed class AgoraChatTools
         }
         catch (AgoraException e)
         {
-            return $"Error: {e.Message}";
+            var known = ChatReaders.ListSessions(perClient: 5)
+                .Where(s => s.Client.Contains(client.Wire(), StringComparison.Ordinal))
+                .Select(s => s.SessionId)
+                .ToList();
+            return $"Error: {e.Message}. " + (known.Count == 0
+                ? $"No {client.Wire()} sessions exist on this machine."
+                : $"Newest {client.Wire()} session ids: {string.Join(", ", known)}.");
         }
         catch (Exception e)
         {
