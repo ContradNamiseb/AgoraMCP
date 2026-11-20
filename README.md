@@ -346,3 +346,7 @@ tools/                     older helper scripts, see docs/reference.md
 It depends on `Microsoft.Data.Sqlite` and `Microsoft.Extensions.Hosting` from
 Microsoft, on `ModelContextProtocol`, the official MCP SDK for C#, and on
 `DesktopNotifications` for the optional desktop notifications.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
