@@ -89,6 +89,11 @@ public enum ChatClient
     [JsonStringEnumMemberName("zcode")] ZCode,
     [JsonStringEnumMemberName("kimicode")] KimiCode,
     [JsonStringEnumMemberName("codex")] Codex,
+    [JsonStringEnumMemberName("antigravity")] Antigravity,
+    [JsonStringEnumMemberName("opencode")] OpenCode,
+    [JsonStringEnumMemberName("github-copilot")] GitHubCopilot,
+    [JsonStringEnumMemberName("vscode")] VsCode,
+    [JsonStringEnumMemberName("cursor")] Cursor,
 }
 
 /// <summary>The persisted string for an enum value: its JSON member name.</summary>

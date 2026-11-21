@@ -46,7 +46,7 @@ public sealed class AgoraResources
         if (sessions.Count == 0)
             return "no chat sessions found for any client.";
         var lines = sessions.Select(s =>
-            $"{s.Client,-10} {s.SessionId}  model={s.Model}  last={s.LastActivity}  turns={s.Turns}");
+            $"{s.Client,-14} {s.SessionId}  model={s.Model}  last={s.LastActivity}  turns={(s.Turns >= 0 ? s.Turns.ToString() : "-")}");
         return "chat sessions (newest first):\n" + string.Join("\n", lines);
     }
 

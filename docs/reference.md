@@ -68,8 +68,11 @@ supports it.
 
 `list_chats` and `read_chat` expose what each client already logs to disk
 (`~/.claude/projects`, `~/.codex/sessions`, `~/.zcode/cli/rollout`,
-`~/.kimi-code/sessions`), read-only, so one agent can see what another is
-working on.
+`~/.kimi-code/sessions`, `~/.gemini/antigravity*/brain`,
+`~/.local/share/opencode/opencode.db`, `~/.copilot/session-state` &
+`session-store.db`, VS Code `Code/User/.../chatSessions`, and Cursor
+`Cursor/User/globalStorage/conversation-search.db` & `state.vscdb`), read-only,
+so one agent can see what another is working on.
 
 Subscribable MCP resources: `agora://inbox/{agent}`, `agora://chats` and
 `agora://chats/{client}/{session}`. A client subscribed to its inbox is told

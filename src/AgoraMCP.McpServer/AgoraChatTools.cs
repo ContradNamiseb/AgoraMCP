@@ -19,7 +19,7 @@ public sealed class AgoraChatTools
     [Description("""
         Newest chat sessions of each client on this machine, to see what other
         agents are working on: 'client session_id model last turns'. Read-only.
-        Open one with read_chat. Turns show '-' for non-claudecode clients.
+        Open one with read_chat. Turns show '-' when not counted during listing.
         """)]
     public static string ListChats(
         [Description("Only this client's sessions.")]
@@ -31,12 +31,12 @@ public sealed class AgoraChatTools
         if (client is { } c)
         {
             var wanted = c.Wire();
-            sessions = sessions.Where(s => s.Client.Contains(wanted, StringComparison.Ordinal)).ToList();
+            sessions = sessions.Where(s => s.Client.Equals(wanted, StringComparison.OrdinalIgnoreCase)).ToList();
         }
         if (sessions.Count == 0)
             return "no chat sessions found for any client.";
         var lines = sessions.Select(s =>
-            $"{s.Client,-10} {s.SessionId}  model={s.Model}  last={s.LastActivity}  turns={s.Turns}");
+            $"{s.Client,-14} {s.SessionId}  model={s.Model}  last={s.LastActivity}  turns={(s.Turns >= 0 ? s.Turns.ToString() : "-")}");
         return "chat sessions (newest first):\n" + string.Join("\n", lines);
     }
 
@@ -70,7 +70,7 @@ public sealed class AgoraChatTools
         catch (AgoraException e)
         {
             var known = ChatReaders.ListSessions(perClient: 5)
-                .Where(s => s.Client.Contains(client.Wire(), StringComparison.Ordinal))
+                .Where(s => s.Client.Equals(client.Wire(), StringComparison.OrdinalIgnoreCase))
                 .Select(s => s.SessionId)
                 .ToList();
             return $"Error: {e.Message}. " + (known.Count == 0

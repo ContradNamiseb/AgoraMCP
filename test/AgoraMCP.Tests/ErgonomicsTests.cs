@@ -105,6 +105,13 @@ public sealed class ErgonomicsTests
             Assert.False(tools.ContainsKey(removed), $"{removed} was folded into respond");
         Assert.Equal(["approved", "changes_required", "rejected", "awaiting_review"],
             verdict.GetProperty("enum").EnumerateArray().Select(e => e.GetString()!).ToArray());
+        var chatClient = tools["list_chats"].GetProperty("inputSchema").GetProperty("properties").GetProperty("client");
+        Assert.Equal(
+            [
+                "claudecode", "zcode", "kimicode", "codex",
+                "antigravity", "opencode", "github-copilot", "vscode", "cursor",
+            ],
+            chatClient.GetProperty("enum").EnumerateArray().Select(e => e.GetString()!).ToArray());
         Assert.All(tools.Values, t => Assert.DoesNotContain('\n', t.GetProperty("description").GetString()!));
     }
 

@@ -114,6 +114,7 @@ when the model behind it changes. These names are built in:
 | `github-copilot` | GitHub Copilot |
 | `zcode` | ZCode |
 | `kimicode` | Kimi Code |
+| `cursor` | Cursor |
 
 Any other name works too. Pick one per client and never change it.
 

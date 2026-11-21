@@ -32,6 +32,7 @@ public static class AgentIdentity
         ["antigravity"] = ["gemini-antigravity"],
         ["github-copilot"] = [],
         ["kimicode"] = [],
+        ["cursor"] = [],
     };
 
     /// <summary>The clients that share this board — what routing and roster display expect.</summary>

@@ -1,5 +1,6 @@
 using System.Text.Json;
 using AgoraMCP.Database;
+using Microsoft.Data.Sqlite;
 
 namespace AgoraMCP.Chats;
 
@@ -18,24 +19,32 @@ public sealed record ChatSession(
 /// <summary>
 /// Read-only readers for the chat transcripts each client on this box already
 /// writes — the cross-agent visibility layer: with these, what any agent said
-/// in its own session is readable by any other agent through agora. Formats
-/// follow the readers proven in the context-counter tool (same machine, same
-/// logs); nothing here writes to any client's files.
+/// in its own session is readable by any other agent through agora. Nothing
+/// here writes to any client's files or databases.
 /// </summary>
-public static class ChatReaders
+public static partial class ChatReaders
 {
+    private const string KnownClientsList =
+        "claudecode, zcode, kimicode, codex, antigravity, opencode, github-copilot, vscode, cursor";
+
     /// <summary>
     /// Lists the newest sessions of every known client. `home` is injectable
     /// for tests; production calls pass nothing and get the user profile.
     /// </summary>
     public static IReadOnlyList<ChatSession> ListSessions(string? home = null, int perClient = 5)
     {
-        home ??= Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var explicitHome = string.IsNullOrWhiteSpace(home) ? null : home;
+        var resolvedHome = explicitHome ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         var sessions = new List<ChatSession>();
-        sessions.AddRange(ClaudeSessions(home, perClient));
-        sessions.AddRange(ZcodeSessions(home, perClient));
-        sessions.AddRange(KimiSessions(home, perClient));
-        sessions.AddRange(CodexSessions(home, perClient));
+        AddSafe(sessions, () => ClaudeSessions(resolvedHome, perClient));
+        AddSafe(sessions, () => ZcodeSessions(resolvedHome, perClient));
+        AddSafe(sessions, () => KimiSessions(resolvedHome, perClient));
+        AddSafe(sessions, () => CodexSessions(resolvedHome, perClient));
+        AddSafe(sessions, () => AntigravitySessions(resolvedHome, perClient));
+        AddSafe(sessions, () => OpenCodeSessions(explicitHome, resolvedHome, perClient));
+        AddSafe(sessions, () => CopilotSessions(resolvedHome, perClient));
+        AddSafe(sessions, () => VsCodeSessions(explicitHome, resolvedHome, perClient));
+        AddSafe(sessions, () => CursorSessions(explicitHome, resolvedHome, perClient));
         sessions.Sort((a, b) => string.CompareOrdinal(b.LastActivity, a.LastActivity));
         return sessions;
     }
@@ -47,19 +56,37 @@ public static class ChatReaders
     public static IReadOnlyList<ChatTurn> Read(
         string client, string sessionId, string? home = null, int limit = 200)
     {
-        home ??= Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var explicitHome = string.IsNullOrWhiteSpace(home) ? null : home;
+        var resolvedHome = explicitHome ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         return client.Trim().ToLowerInvariant() switch
         {
-            "zcode" => ZcodeRead(home, sessionId),
-            "claudecode" or "claude" => ClaudeRead(home, sessionId),
-            "kimicode" or "kimi" => KimiRead(home, sessionId),
-            "codex" => CodexRead(home, sessionId),
+            "zcode" => ZcodeRead(resolvedHome, sessionId),
+            "claudecode" or "claude" => ClaudeRead(resolvedHome, sessionId),
+            "kimicode" or "kimi" => KimiRead(resolvedHome, sessionId),
+            "codex" => CodexRead(resolvedHome, sessionId),
+            "antigravity" or "agy" or "antigravity-ide" => AntigravityRead(resolvedHome, sessionId),
+            "opencode" => OpenCodeRead(explicitHome, resolvedHome, sessionId),
+            "github-copilot" or "copilot" or "gh-copilot" => CopilotRead(resolvedHome, sessionId),
+            "vscode" or "vs-code" or "code" => VsCodeRead(explicitHome, resolvedHome, sessionId),
+            "cursor" => CursorRead(explicitHome, resolvedHome, sessionId),
             _ => throw new AgoraException(
-                $"unknown client '{client}' — known: claudecode, zcode, kimicode, codex"),
+                $"unknown client '{client}' — known: {KnownClientsList}"),
         };
     }
 
-    // --- shared JSON helpers ---------------------------------------------------
+    // --- shared JSON, file, path and SQLite helpers -----------------------------
+
+    private static void AddSafe(List<ChatSession> target, Func<IEnumerable<ChatSession>> collect)
+    {
+        try
+        {
+            target.AddRange(collect());
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SqliteException)
+        {
+            // A client mid-write or a locked DB must not take down listing for the others.
+        }
+    }
 
     private static JsonDocument? Parse(string line)
     {
@@ -69,6 +96,150 @@ public static class ChatReaders
 
     private static string? Str(JsonElement e) =>
         e.ValueKind == JsonValueKind.String ? e.GetString() : null;
+
+    /// <summary>
+    /// Opens a file with ReadWrite|Delete sharing so active writers on Windows
+    /// (VS Code, Antigravity, Copilot, etc.) do not cause sharing violations.
+    /// </summary>
+    private static IEnumerable<string> ReadLinesShared(string path)
+    {
+        using var stream = new FileStream(
+            path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var reader = new StreamReader(stream);
+        while (reader.ReadLine() is { } line)
+            yield return line;
+    }
+
+    private static string ReadAllTextShared(string path)
+    {
+        using var stream = new FileStream(
+            path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var reader = new StreamReader(stream);
+        return reader.ReadToEnd();
+    }
+
+    private static SqliteConnection OpenReadOnlySqlite(string dbPath)
+    {
+        var cs = new SqliteConnectionStringBuilder
+        {
+            DataSource = dbPath,
+            Mode = SqliteOpenMode.ReadOnly,
+            Pooling = false,
+            DefaultTimeout = 2,
+        }.ToString();
+        var conn = new SqliteConnection(cs);
+        conn.Open();
+        return conn;
+    }
+
+    private static bool SqliteTableExists(SqliteConnection conn, string tableName)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = $name LIMIT 1";
+        cmd.Parameters.AddWithValue("$name", tableName);
+        return cmd.ExecuteScalar() is not null;
+    }
+
+    private static bool SqliteColumnExists(SqliteConnection conn, string tableName, string columnName)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = $"PRAGMA table_info(\"{tableName}\")";
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            if (string.Equals(reader.GetString(1), columnName, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
+    private static string? FormatEpoch(long value)
+    {
+        if (value <= 0) return null;
+        try
+        {
+            var dto = value < 10_000_000_000L
+                ? DateTimeOffset.FromUnixTimeSeconds(value)
+                : DateTimeOffset.FromUnixTimeMilliseconds(value);
+            return dto.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ");
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            return null;
+        }
+    }
+
+    private static bool IsSafeIdSegment(string sessionId) =>
+        !string.IsNullOrWhiteSpace(sessionId) &&
+        sessionId.IndexOfAny(['/', '\\']) < 0 &&
+        !sessionId.Contains("..", StringComparison.Ordinal);
+
+    private static string? NonEmpty(string? value) =>
+        string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+
+    private static bool IsSyntheticHome(string? explicitHome, string resolvedHome)
+    {
+        if (explicitHome is null) return false;
+        var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        if (string.IsNullOrEmpty(userProfile)) return true;
+        var normExplicit = Path.GetFullPath(resolvedHome).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var normProfile = Path.GetFullPath(userProfile).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        return !string.Equals(normExplicit, normProfile, comparison);
+    }
+
+    /// <summary>
+    /// Resolves Electron/VS Code-style `<appName>/User` directories for both live
+    /// user profiles (Windows %APPDATA%, macOS Application Support, Linux XDG) and
+    /// synthetic test homes.
+    /// </summary>
+    private static IEnumerable<string> AppDataUserDirs(
+        string? explicitHome, string resolvedHome, params string[] appNames)
+    {
+        var seen = new HashSet<string>(
+            OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+        var synthetic = IsSyntheticHome(explicitHome, resolvedHome);
+
+        foreach (var appName in appNames)
+        {
+            IEnumerable<string> candidates;
+            if (!synthetic)
+            {
+                if (OperatingSystem.IsWindows())
+                {
+                    var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+                    candidates = string.IsNullOrEmpty(appData)
+                        ? [Path.Combine(resolvedHome, "AppData", "Roaming", appName, "User")]
+                        : [Path.Combine(appData, appName, "User")];
+                }
+                else if (OperatingSystem.IsMacOS())
+                {
+                    candidates = [Path.Combine(resolvedHome, "Library", "Application Support", appName, "User")];
+                }
+                else
+                {
+                    var xdg = NonEmpty(Environment.GetEnvironmentVariable("XDG_CONFIG_HOME"))
+                        ?? Path.Combine(resolvedHome, ".config");
+                    candidates = [Path.Combine(xdg, appName, "User")];
+                }
+            }
+            else
+            {
+                candidates =
+                [
+                    Path.Combine(resolvedHome, "AppData", "Roaming", appName, "User"),
+                    Path.Combine(resolvedHome, ".config", appName, "User"),
+                    Path.Combine(resolvedHome, "Library", "Application Support", appName, "User"),
+                ];
+            }
+
+            foreach (var dir in candidates)
+            {
+                if (Directory.Exists(dir) && seen.Add(dir))
+                    yield return dir;
+            }
+        }
+    }
 
     /// <summary>Claude-style content: a plain string, or blocks with text parts.</summary>
     private static string ContentText(JsonElement content)
@@ -82,7 +253,7 @@ public static class ChatReaders
                 foreach (var block in content.EnumerateArray())
                 {
                     if (block.ValueKind != JsonValueKind.Object) continue;
-                    // Claude writes "text" blocks, codex "input_text"/"output_text".
+                    // Claude/OpenCode write "text" blocks, codex "input_text"/"output_text".
                     if (block.TryGetProperty("type", out var type) &&
                         Str(type) is "text" or "input_text" or "output_text" &&
                         block.TryGetProperty("text", out var text) &&
@@ -125,7 +296,7 @@ public static class ChatReaders
         // Two passes would cost a full read; one line-scan collects everything.
         string? model = null, last = null, sid = Path.GetFileNameWithoutExtension(path);
         var turns = 0;
-        foreach (var line in File.ReadLines(path))
+        foreach (var line in ReadLinesShared(path))
         {
             using var doc = Parse(line);
             if (doc is null) continue;
@@ -147,7 +318,7 @@ public static class ChatReaders
         var path = NewestFiles(ClaudeHome(home), $"{sessionId}.jsonl", 1).FirstOrDefault()
             ?? throw new AgoraException($"no claudecode session '{sessionId}' found");
         var turns = new List<ChatTurn>();
-        foreach (var line in File.ReadLines(path))
+        foreach (var line in ReadLinesShared(path))
         {
             using var doc = Parse(line);
             if (doc is null) continue;
@@ -183,7 +354,7 @@ public static class ChatReaders
     {
         // The model id sits on every record; the last line is cheapest.
         string? last = null;
-        foreach (var line in File.ReadLines(path)) last = line;
+        foreach (var line in ReadLinesShared(path)) last = line;
         if (last is null) return "?";
         using var doc = Parse(last);
         if (doc?.RootElement.TryGetProperty("model", out var m) == true &&
@@ -198,7 +369,7 @@ public static class ChatReaders
             ?? NewestFiles(ZcodeHome(home), $"*{sessionId}*.jsonl", 1).FirstOrDefault()
             ?? throw new AgoraException($"no zcode session '{sessionId}' found");
         string? last = null;
-        foreach (var line in File.ReadLines(path)) last = line;
+        foreach (var line in ReadLinesShared(path)) last = line;
         using var doc = last is null ? null : Parse(last);
         // Current rollouts nest the API body under request.body; older ones put
         // the messages directly on request.
@@ -241,7 +412,7 @@ public static class ChatReaders
             .FirstOrDefault(p => p.Contains(sessionId, StringComparison.OrdinalIgnoreCase))
             ?? throw new AgoraException($"no kimicode session '{sessionId}' found");
         var turns = new List<ChatTurn>();
-        foreach (var line in File.ReadLines(path))
+        foreach (var line in ReadLinesShared(path))
         {
             using var doc = Parse(line);
             if (doc is null) continue;
@@ -290,7 +461,7 @@ public static class ChatReaders
             .FirstOrDefault(p => p.Contains(sessionId, StringComparison.OrdinalIgnoreCase))
             ?? throw new AgoraException($"no codex session '{sessionId}' found");
         var turns = new List<ChatTurn>();
-        foreach (var line in File.ReadLines(path))
+        foreach (var line in ReadLinesShared(path))
         {
             using var doc = Parse(line);
             if (doc is null) continue;
