@@ -121,12 +121,16 @@ public sealed class AgoraWorkflowTools
         var done = new List<string>();
         try
         {
+            // Wrap multi-table writes (message + review + turn pass + status + ack)
+            // in one SQLite transaction so concurrent tail/bridge readers never
+            // observe a reply before its companion turn_events row commits.
+            using var tx = db.BeginTransaction();
             long? posted = null;
             if (text.Length > 0)
             {
                 var message = kind == MessageKind.Review
-                    ? ThreadStore.SubmitReview(db, thread_id, text, me, ServerState.Cache)
-                    : ThreadStore.Reply(db, thread_id, text, me, ServerState.Cache);
+                    ? ThreadStore.SubmitReview(db, thread_id, text, me, ServerState.Cache, tx)
+                    : ThreadStore.Reply(db, thread_id, text, me, ServerState.Cache, tx);
                 posted = message.Id;
                 done.Add($"posted {kind.Wire()} #{message.Id}" +
                          (kind == MessageKind.Review ? " (thread answered)" : ""));
@@ -170,14 +174,13 @@ public sealed class AgoraWorkflowTools
                 }
             }
 
+            tx.Commit();
             NamedBoardEvent.Broadcast(ServerState.ResolveDbPath());
         }
         catch (Exception e)
         {
             var reason = e is AgoraException ? e.Message : $"{e.GetType().Name}: {e.Message}";
-            return done.Count == 0
-                ? $"Error: {reason}"
-                : $"partial: {string.Join("; ", done)}. Then failed: {reason}. Do not repeat the parts already written.";
+            return $"Error: respond: {reason}. Nothing was written.";
         }
 
         var lines = new List<string> { $"thread #{thread_id} by {me}: {string.Join("; ", done)}." };

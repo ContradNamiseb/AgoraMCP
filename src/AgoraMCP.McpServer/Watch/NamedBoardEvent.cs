@@ -118,11 +118,12 @@ public static class NamedBoardEvent
                 }
                 catch (WaitHandleCannotBeOpenedException)
                 {
-                    // Listener is not up right now. Prune orphaned ephemeral tail/channel
+                    // Listener is not up right now. Prune orphaned ephemeral tail/channel/bridge
                     // event files so crashed sessions do not accumulate files forever.
                     var leaf = Path.GetFileName(file);
                     if (leaf.StartsWith("tail-", StringComparison.OrdinalIgnoreCase) ||
-                        leaf.StartsWith("channel-", StringComparison.OrdinalIgnoreCase))
+                        leaf.StartsWith("channel-", StringComparison.OrdinalIgnoreCase) ||
+                        leaf.StartsWith("bridge-", StringComparison.OrdinalIgnoreCase))
                     {
                         try
                         {

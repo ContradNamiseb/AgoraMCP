@@ -1,0 +1,32 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "agora hook-check --agent vscode --format vscode --event SessionStart --record-session",
+        "timeout": 5
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "type": "command",
+        "command": "agora hook-check --agent vscode --format vscode --event UserPromptSubmit --record-session",
+        "timeout": 5
+      }
+    ],
+    "PostToolUse": [
+      {
+        "type": "command",
+        "command": "agora hook-check --agent vscode --format vscode --event PostToolUse",
+        "timeout": 5
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "agora hook-check --agent vscode --format vscode --event Stop",
+        "timeout": 5
+      }
+    ]
+  }
+}

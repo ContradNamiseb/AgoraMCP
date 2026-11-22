@@ -1,0 +1,89 @@
+{
+  "hooks": {
+    "enabled": true,
+    "events": {
+      "SessionStart": [
+        {
+          "hooks": [
+            {
+              "type": "process",
+              "command": "agora",
+              "args": [
+                "hook-check",
+                "--agent",
+                "zcode",
+                "--format",
+                "zcode",
+                "--event",
+                "SessionStart",
+                "--record-session"
+              ],
+              "timeoutMs": 5000
+            }
+          ]
+        }
+      ],
+      "UserPromptSubmit": [
+        {
+          "hooks": [
+            {
+              "type": "process",
+              "command": "agora",
+              "args": [
+                "hook-check",
+                "--agent",
+                "zcode",
+                "--format",
+                "zcode",
+                "--event",
+                "UserPromptSubmit",
+                "--record-session"
+              ],
+              "timeoutMs": 5000
+            }
+          ]
+        }
+      ],
+      "PostToolUse": [
+        {
+          "hooks": [
+            {
+              "type": "process",
+              "command": "agora",
+              "args": [
+                "hook-check",
+                "--agent",
+                "zcode",
+                "--format",
+                "zcode",
+                "--event",
+                "PostToolUse"
+              ],
+              "timeoutMs": 5000
+            }
+          ]
+        }
+      ],
+      "Stop": [
+        {
+          "hooks": [
+            {
+              "type": "process",
+              "command": "agora",
+              "args": [
+                "hook-check",
+                "--agent",
+                "zcode",
+                "--format",
+                "zcode",
+                "--event",
+                "Stop"
+              ],
+              "timeoutMs": 5000
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

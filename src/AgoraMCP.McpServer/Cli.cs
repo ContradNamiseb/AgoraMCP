@@ -334,6 +334,7 @@ internal static class Cli
                     var toRole = Option(args, "--to-role") ?? "";
                     var stage = Option(args, "--stage") ?? "";
                     var evnt = TurnStore.Pass(db, thread, from, passTo, instruction, fromRole, toRole, stage);
+                    NamedBoardEvent.Broadcast(Config.ResolveDbPath(dbFlag));
                     var toRoleTag = evnt.ToRole.Length > 0 ? $" [{evnt.ToRole}]" : "";
                     var fromRoleTag = evnt.FromRole.Length > 0 ? $" [{evnt.FromRole}]" : "";
                     var stageTag = evnt.Stage.Length > 0 ? $" (stage: {evnt.Stage})" : "";
@@ -414,9 +415,24 @@ internal static class Cli
           subscribe [--agent N] [--hub H:P]  agent sidecar: print one event JSON per line
                     [--since ID]             until killed (reconnects from last seq)
           tail --agent NAME [--db PATH]      hub-less push stream: waits on NamedBoardEvent
-               [--since ID] [--dms-only]     (0% CPU) and prints one JSON event per line for
-               [--all] [--once]              incoming DMs and directed mail (starts at now
-               [--timeout S] [--interval S]  unless --since is given)
+               [--since ID] [--since-turn N] (0% CPU) and prints one JSON event per line for
+               [--dms-only] [--all] [--once] incoming DMs, directed mail, and turn passes
+               [--timeout S] [--interval S]  (starts at now unless --since is given);
+               [--parent-pid PID]            --exit-with-parent / --parent-pid /
+               [--exit-with-parent]          --exit-on-stdin-eof exit when host dies
+               [--exit-on-stdin-eof]
+          hook-check --agent NAME            fast lifecycle hook check for SessionStart,
+               [--format FMT] [--event EV]   UserPromptSubmit, PostToolUse, and Stop across
+               [--record-session]            Codex, Cursor, VS Code, Copilot, Kimi, ZCode,
+               [--state P] [--max-blocks N]  Claude, and Antigravity (fail-silent)
+               [--dms-only] [--all]
+          bridge --client codex|kimi-web|opencode
+               [--agent NAME] [--session ID] hub-less idle-wake dispatcher waiting on
+               [--session-file P] [--url U]  NamedBoardEvent (0% CPU) and injecting mail via
+               [--token T] [--exe PATH]      sanctioned client APIs (codex queue, kimi web
+               [--max-wakes N] [--dms-only]  REST, opencode api); --max-wakes caps per-
+               [--all] [--once] [--dry-run]  thread wakes per 10m (default 6, 0=unlimited)
+               [--timeout S]
 
         The database is shared by convention: --db flag, then $AGORA_DB, then
         %LOCALAPPDATA%\AgoraMCP\agora.db. Every agent that wants to share the

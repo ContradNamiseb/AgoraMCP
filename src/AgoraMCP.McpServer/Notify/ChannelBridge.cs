@@ -23,9 +23,11 @@ internal sealed class ChannelBridge(ModelContextProtocol.Server.McpServer server
 
         var dbPath = ServerState.ResolveDbPath();
         long cursor;
+        long turnCursor;
         try
         {
             cursor = NotifyHub.ReadMaxSeq(dbPath);
+            turnCursor = NotifyHub.ReadMaxTurnSeq(dbPath);
         }
         catch (Exception e)
         {
@@ -58,8 +60,8 @@ internal sealed class ChannelBridge(ModelContextProtocol.Server.McpServer server
                 try
                 {
                     await WaitForWakeAsync(ownEvent, FallbackPollInterval, stoppingToken);
-                    var (events, maxSeq) = NotifyHub.ReadEventsSince(
-                        dbPath, cursor, agent, directedOnly: true, excludeSelf: true);
+                    var (events, maxSeq, maxTurnSeq) = NotifyHub.ReadCombinedSince(
+                        dbPath, cursor, turnCursor, agent, directedOnly: true, excludeSelf: true);
                     foreach (var ev in events)
                     {
                         await server.SendNotificationAsync(
@@ -78,6 +80,7 @@ internal sealed class ChannelBridge(ModelContextProtocol.Server.McpServer server
                             cancellationToken: stoppingToken);
                     }
                     if (maxSeq > cursor) cursor = maxSeq;
+                    if (maxTurnSeq > turnCursor) turnCursor = maxTurnSeq;
                 }
                 catch (OperationCanceledException) { break; }
                 catch (Exception e)

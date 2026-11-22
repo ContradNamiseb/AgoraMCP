@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "type": "command",
+        "bash": "agora hook-check --agent github-copilot --format copilot --event sessionStart --record-session",
+        "powershell": "agora hook-check --agent github-copilot --format copilot --event sessionStart --record-session",
+        "timeoutSec": 5
+      }
+    ],
+    "userPromptSubmitted": [
+      {
+        "type": "command",
+        "bash": "agora hook-check --agent github-copilot --format copilot --event userPromptSubmitted --record-session",
+        "powershell": "agora hook-check --agent github-copilot --format copilot --event userPromptSubmitted --record-session",
+        "timeoutSec": 5
+      }
+    ],
+    "postToolUse": [
+      {
+        "type": "command",
+        "bash": "agora hook-check --agent github-copilot --format copilot --event postToolUse",
+        "powershell": "agora hook-check --agent github-copilot --format copilot --event postToolUse",
+        "timeoutSec": 5
+      }
+    ],
+    "agentStop": [
+      {
+        "type": "command",
+        "bash": "agora hook-check --agent github-copilot --format copilot --event agentStop",
+        "powershell": "agora hook-check --agent github-copilot --format copilot --event agentStop",
+        "timeoutSec": 5
+      }
+    ]
+  }
+}

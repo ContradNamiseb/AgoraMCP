@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "hooks": {
+    "beforeSubmitPrompt": [
+      {
+        "command": "agora hook-check --agent cursor --format cursor --event beforeSubmitPrompt --record-session"
+      }
+    ],
+    "stop": [
+      {
+        "command": "agora hook-check --agent cursor --format cursor --event stop"
+      }
+    ]
+  }
+}

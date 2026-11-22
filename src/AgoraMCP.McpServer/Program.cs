@@ -1,3 +1,4 @@
+using System.Globalization;
 using AgoraMCP.Database;
 using AgoraMCP.McpServer.Watch;
 
@@ -47,6 +48,8 @@ internal static class Program
                 "hub" => Hub(Option(args, "--db"), Option(args, "--port")),
                 "subscribe" => SubscribeCmd(Option(args, "--agent"), Option(args, "--hub"), Option(args, "--since")),
                 "tail" => TailCmd(args),
+                "hook-check" => HookCheckCmd(args),
+                "bridge" => BridgeCmd(args),
                 "help" or "--help" or "-h" => Help(0),
                 var unknown => Fail($"unknown command '{unknown}'"),
             };
@@ -123,24 +126,131 @@ internal static class Program
     {
         var agent = Option(args, "--agent") ?? Environment.GetEnvironmentVariable("AGORA_AGENT") ?? "";
         var db = Option(args, "--db");
-        var sinceRaw = Option(args, "--since");
-        var timeoutRaw = Option(args, "--timeout");
-        var intervalRaw = Option(args, "--interval");
+        if (!TryParseOptionalLong(args, "--since", "tail", out var since)) return 2;
+        if (!TryParseOptionalLong(args, "--since-turn", "tail", out var sinceTurn)) return 2;
+        if (!TryParseOptionalDouble(args, "--timeout", "tail", out var timeout)) return 2;
+        if (!TryParseOptionalDouble(args, "--interval", "tail", out var interval)) return 2;
+        if (!TryParseOptionalInt(args, "--parent-pid", "tail", out var parentPid)) return 2;
+
         var cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
         return Notify.BoardTail.RunAsync(new Notify.BoardTail.Options
         {
             DbPath = string.IsNullOrWhiteSpace(db) ? Config.ResolveDbPath() : db,
             Agent = agent,
-            Since = long.TryParse(sinceRaw, out var s) ? s : null,
+            Since = since,
+            SinceTurn = sinceTurn,
             IncludeAll = args.Contains("--all"),
             DmsOnly = args.Contains("--dms-only"),
             Once = args.Contains("--once"),
-            TimeoutSeconds = double.TryParse(timeoutRaw, out var to) ? to : null,
-            IntervalSeconds = double.TryParse(intervalRaw, out var iv)
-                ? iv
-                : (NamedBoardEvent.IsSupported ? 5 : 1),
+            TimeoutSeconds = timeout,
+            IntervalSeconds = interval ?? (NamedBoardEvent.IsSupported ? 5 : 1),
+            ParentPid = parentPid,
+            ExitWithParent = args.Contains("--exit-with-parent"),
+            ExitOnStdinEof = args.Contains("--exit-on-stdin-eof"),
         }, stdout: null, token: cts.Token).GetAwaiter().GetResult();
+    }
+
+    private static int HookCheckCmd(string[] args)
+    {
+        var agent = Option(args, "--agent") ?? Environment.GetEnvironmentVariable("AGORA_AGENT") ?? "";
+        var db = Option(args, "--db");
+        if (!TryParseOptionalLong(args, "--since", "hook-check", out var since)) return 2;
+        if (!TryParseOptionalInt(args, "--max-blocks", "hook-check", out var maxBlocks)) return 2;
+
+        return Notify.HookCheck.Run(new Notify.HookCheck.Options
+        {
+            DbPath = string.IsNullOrWhiteSpace(db) ? Config.ResolveDbPath() : db,
+            Agent = agent,
+            Format = Option(args, "--format") ?? "standard",
+            EventName = Option(args, "--event") ?? "auto",
+            StatePath = Option(args, "--state"),
+            RecordSession = args.Contains("--record-session"),
+            SessionFilePath = Option(args, "--session-file"),
+            Since = since,
+            IncludeAll = args.Contains("--all"),
+            DmsOnly = args.Contains("--dms-only"),
+            NoAdvance = args.Contains("--no-advance"),
+            MaxBlocks = maxBlocks ?? Notify.HookCheck.DefaultMaxBlocks,
+        });
+    }
+
+    private static int BridgeCmd(string[] args)
+    {
+        var client = Option(args, "--client") ?? "";
+        var agent = Option(args, "--agent");
+        var db = Option(args, "--db");
+        if (!TryParseOptionalLong(args, "--since", "bridge", out var since)) return 2;
+        if (!TryParseOptionalLong(args, "--since-turn", "bridge", out var sinceTurn)) return 2;
+        if (!TryParseOptionalDouble(args, "--timeout", "bridge", out var timeout)) return 2;
+        if (!TryParseOptionalDouble(args, "--interval", "bridge", out var interval)) return 2;
+        if (!TryParseOptionalInt(args, "--max-wakes", "bridge", out var maxWakes)) return 2;
+
+        var cts = new CancellationTokenSource();
+        Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+        return Notify.ClientBridge.RunAsync(new Notify.ClientBridge.Options
+        {
+            DbPath = string.IsNullOrWhiteSpace(db) ? Config.ResolveDbPath() : db,
+            Client = client,
+            Agent = agent,
+            SessionId = Option(args, "--session"),
+            SessionFilePath = Option(args, "--session-file"),
+            ServerUrl = Option(args, "--url"),
+            AuthToken = Option(args, "--token"),
+            ExecutablePath = Option(args, "--exe"),
+            Since = since,
+            SinceTurn = sinceTurn,
+            IncludeAll = args.Contains("--all"),
+            DmsOnly = args.Contains("--dms-only"),
+            Once = args.Contains("--once"),
+            DryRun = args.Contains("--dry-run"),
+            TimeoutSeconds = timeout,
+            IntervalSeconds = interval ?? (NamedBoardEvent.IsSupported ? 5 : 1),
+            MaxWakesPerThread = maxWakes ?? 6,
+        }, log: null, token: cts.Token).GetAwaiter().GetResult();
+    }
+
+    private static bool TryParseOptionalLong(string[] args, string flag, string cmd, out long? value)
+    {
+        value = null;
+        var raw = Option(args, flag);
+        if (raw is null) return true;
+        if (long.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed) && parsed >= 0)
+        {
+            value = parsed;
+            return true;
+        }
+        Console.Error.WriteLine($"{cmd}: invalid {flag} '{raw}' (expected non-negative integer).");
+        return false;
+    }
+
+    private static bool TryParseOptionalInt(string[] args, string flag, string cmd, out int? value)
+    {
+        value = null;
+        var raw = Option(args, flag);
+        if (raw is null) return true;
+        if (int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed) && parsed >= 0)
+        {
+            value = parsed;
+            return true;
+        }
+        Console.Error.WriteLine($"{cmd}: invalid {flag} '{raw}' (expected non-negative integer).");
+        return false;
+    }
+
+    private static bool TryParseOptionalDouble(string[] args, string flag, string cmd, out double? value)
+    {
+        value = null;
+        var raw = Option(args, flag);
+        if (raw is null) return true;
+        if (double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed)
+            && !double.IsNaN(parsed) && !double.IsInfinity(parsed) && parsed > 0)
+        {
+            value = parsed;
+            return true;
+        }
+        Console.Error.WriteLine($"{cmd}: invalid {flag} '{raw}' (expected positive number, e.g. 0.5 or 5).");
+        return false;
     }
 
     private static int Fail(string message)

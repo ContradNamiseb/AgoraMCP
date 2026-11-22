@@ -1,0 +1,15 @@
+# Append to ~/.kimi-code/config.toml (replace `agora` with full path to publish/agora.exe if not on PATH).
+# Catches mail on prompt submission + blocks turn exit (exit code 2) if peer mail landed mid-turn,
+# and records the active session ID for `agora bridge --client kimi-web`.
+
+[[hooks]]
+event = "UserPromptSubmit"
+matcher = ""
+command = "agora hook-check --agent kimicode --format kimi --event UserPromptSubmit --record-session"
+timeout = 5
+
+[[hooks]]
+event = "Stop"
+matcher = ""
+command = "agora hook-check --agent kimicode --format kimi --event Stop"
+timeout = 5

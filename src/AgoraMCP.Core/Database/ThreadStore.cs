@@ -96,8 +96,9 @@ public static class ThreadStore
     /// on missing or closed threads (closed threads take reply, not review).
     /// </summary>
     public static ThreadMessage SubmitReview(
-        SqliteConnection db, long threadId, string body, string author, MessageCache? cache = null) =>
-        AddMessage(db, threadId, "review", body, author, cache);
+        SqliteConnection db, long threadId, string body, string author, MessageCache? cache = null,
+        SqliteTransaction? transaction = null) =>
+        AddMessage(db, threadId, "review", body, author, cache, transaction);
 
     /// <summary>
     /// Append a follow-up: discussion on any live thread without moving its
@@ -105,8 +106,9 @@ public static class ThreadStore
     /// the record.
     /// </summary>
     public static ThreadMessage Reply(
-        SqliteConnection db, long threadId, string body, string author, MessageCache? cache = null) =>
-        AddMessage(db, threadId, "reply", body, author, cache);
+        SqliteConnection db, long threadId, string body, string author, MessageCache? cache = null,
+        SqliteTransaction? transaction = null) =>
+        AddMessage(db, threadId, "reply", body, author, cache, transaction);
 
     /// <summary>
     /// Pending questions: open, past since_id, cheap (no bodies). Directed
@@ -398,7 +400,8 @@ public static class ThreadStore
     // ---- internals ----
 
     private static ThreadMessage AddMessage(
-        SqliteConnection db, long threadId, string kind, string? body, string? author, MessageCache? cache = null)
+        SqliteConnection db, long threadId, string kind, string? body, string? author,
+        MessageCache? cache = null, SqliteTransaction? outerTx = null)
     {
         // Same boundary rule as PostQuestion: coalesce before Trim so the
         // author check below is reachable — author.Trim() on a null used to
@@ -419,7 +422,8 @@ public static class ThreadStore
         if (kind == "review" && threadStatus == StatusClosed)
             throw new AgoraException($"thread {threadId} is closed — closed threads take reply, not review.");
 
-        using var tx = db.BeginTransaction();
+        using var ownedTx = outerTx is null ? db.BeginTransaction() : null;
+        var tx = outerTx ?? ownedTx!;
 
         var insert = db.Prepare("""
             INSERT INTO messages(thread_id, author, kind, body)
@@ -439,7 +443,7 @@ public static class ThreadStore
         update.SetAll(newStatus, AgoraDatabase.Now(), threadId).ExecuteNonQuery();
 
         AppendFts(db, tx, threadId, "", "", body);
-        tx.Commit();
+        ownedTx?.Commit();
 
         var message = new ThreadMessage
         {

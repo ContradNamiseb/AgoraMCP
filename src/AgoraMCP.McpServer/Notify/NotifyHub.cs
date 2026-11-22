@@ -23,7 +23,8 @@ public sealed record BoardEvent(
     [property: JsonPropertyName("topic")] string Topic,
     [property: JsonPropertyName("directed_to")] string DirectedTo,
     [property: JsonPropertyName("at")] string CreatedAt,
-    [property: JsonPropertyName("body")] string Body = "");
+    [property: JsonPropertyName("body")] string Body = "",
+    [property: JsonPropertyName("turn_seq"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] long? TurnSeq = null);
 
 /// <summary>
 /// In-binary push fan-out: a resident loopback SSE hub. No scripts, no
@@ -273,14 +274,21 @@ public static class NotifyHub
         return db.Scalar<long>("SELECT COALESCE(MAX(id), 0) FROM messages");
     }
 
+    internal static long ReadMaxTurnSeq(string dbPath)
+    {
+        using var db = AgoraDatabase.Open(dbPath);
+        return db.Scalar<long>("SELECT COALESCE(MAX(id), 0) FROM turn_events");
+    }
+
     /// <summary>
     /// Computes the true recipient of a message:
     /// - On DM threads (one shared thread per pair, where threads.directed_to
     ///   stays frozen as the initial recipient), the recipient is whichever party
     ///   (created_by or directed_to) is NOT the message author.
-    /// - On board threads, threads.directed_to wins; if the thread is open
-    ///   (directed_to empty) and a turn pass handed the thread to another agent,
-    ///   the current turn holder is the recipient.
+    /// - On board threads, an explicit turn pass to another agent wins (even on
+    ///   a directed thread handed off to a third reviewer).
+    /// - Otherwise, on directed board threads: the asker's posts go to
+    ///   directed_to, and directed_to's replies route back to created_by.
     /// </summary>
     internal static string EffectiveRecipient(
         string threadKind, string createdBy, string directedTo, string turnHolder, string author)
@@ -291,9 +299,119 @@ public static class NotifyHub
             if (AgentIdentity.AnswersTo(directedTo, author)) return createdBy;
             return directedTo;
         }
-        if (directedTo.Length > 0) return directedTo;
-        if (turnHolder.Length > 0 && !AgentIdentity.AnswersTo(turnHolder, author)) return turnHolder;
+        if (turnHolder.Length > 0 && !AgentIdentity.AnswersTo(turnHolder, author))
+            return turnHolder;
+        if (directedTo.Length > 0)
+        {
+            if (AgentIdentity.AnswersTo(directedTo, author)) return createdBy;
+            return directedTo;
+        }
         return "";
+    }
+
+    internal static (List<BoardEvent> Events, long MaxTurnSeq) ReadTurnEventsSince(
+        string dbPath,
+        long sinceTurnId,
+        string agent,
+        bool excludeSelf = true)
+    {
+        using var db = AgoraDatabase.Open(dbPath);
+        var rows = db.Prepare("""
+            SELECT te.id, te.thread_id, te.from_agent, te.to_agent,
+                   te.from_role, te.to_role, te.stage, te.instruction, te.created_at,
+                   t.topic
+            FROM turn_events te
+            JOIN threads t ON t.id = te.thread_id
+            WHERE te.id > $since
+            ORDER BY te.id
+            LIMIT 500
+            """, "$since")
+            .Set("$since", sinceTurnId)
+            .Query(r => (
+                Id: r.GetInt64("id"),
+                ThreadId: r.GetInt64("thread_id"),
+                FromAgent: r.GetString("from_agent"),
+                ToAgent: r.GetString("to_agent"),
+                FromRole: r.GetString("from_role"),
+                ToRole: r.GetString("to_role"),
+                Stage: r.GetString("stage"),
+                Instruction: r.GetString("instruction"),
+                At: r.GetString("created_at"),
+                Topic: r.GetString("topic")));
+
+        var maxTurn = sinceTurnId;
+        var events = new List<BoardEvent>();
+        var target = agent.Trim();
+        foreach (var r in rows)
+        {
+            if (r.Id > maxTurn) maxTurn = r.Id;
+            if (target.Length > 0)
+            {
+                if (excludeSelf && AgentIdentity.AnswersTo(target, r.FromAgent)) continue;
+                if (!AgentIdentity.AnswersTo(target, r.ToAgent)) continue;
+            }
+
+            var meta = new List<string>();
+            if (r.ToRole.Length > 0) meta.Add($"role={r.ToRole}");
+            if (r.Stage.Length > 0) meta.Add($"stage={r.Stage}");
+            var prefix = meta.Count > 0 ? $"[turn passed ({string.Join(", ", meta)})] " : "[turn passed] ";
+            var body = prefix + r.Instruction;
+
+            events.Add(new BoardEvent(
+                Seq: 0,
+                Kind: "turn_pass",
+                ThreadId: r.ThreadId,
+                MsgId: 0,
+                Author: r.FromAgent,
+                Topic: r.Topic,
+                DirectedTo: r.ToAgent,
+                CreatedAt: r.At,
+                Body: body,
+                TurnSeq: r.Id));
+        }
+        return (events, maxTurn);
+    }
+
+    /// <summary>
+    /// Reads both new <c>messages</c> and (when not <paramref name="dmsOnly"/>)
+    /// new <c>turn_events</c> since their respective cursors. Deduplicates a
+    /// turn pass that landed in the same batch as a message already emitted for
+    /// the same (thread, author, recipient) so <c>respond(body + pass_to)</c>
+    /// never double-wakes, while body-less turn passes and delayed turn passes
+    /// always emit a live <c>turn_pass</c> event.
+    /// </summary>
+    internal static (List<BoardEvent> Events, long MaxMsgSeq, long MaxTurnSeq) ReadCombinedSince(
+        string dbPath,
+        long sinceMsgId,
+        long sinceTurnId,
+        string agent,
+        bool directedOnly = false,
+        bool dmsOnly = false,
+        bool excludeSelf = false)
+    {
+        var (msgEvents, maxMsg) = ReadEventsSince(
+            dbPath, sinceMsgId, agent, directedOnly, dmsOnly, excludeSelf);
+
+        if (dmsOnly)
+            return (msgEvents, maxMsg, sinceTurnId);
+
+        var (turnEvents, maxTurn) = ReadTurnEventsSince(
+            dbPath, sinceTurnId, agent, excludeSelf);
+
+        if (turnEvents.Count == 0)
+            return (msgEvents, maxMsg, maxTurn);
+
+        foreach (var te in turnEvents)
+        {
+            var coveredByMessage = msgEvents.Any(m =>
+                m.ThreadId == te.ThreadId &&
+                AgentIdentity.AnswersTo(m.Author, te.Author) &&
+                AgentIdentity.AnswersTo(m.DirectedTo, te.DirectedTo));
+            if (!coveredByMessage)
+                msgEvents.Add(te with { Seq = maxMsg });
+        }
+
+        return (msgEvents, maxMsg, maxTurn);
     }
 
     internal static (List<BoardEvent> Events, long MaxSeq) ReadEventsSince(
