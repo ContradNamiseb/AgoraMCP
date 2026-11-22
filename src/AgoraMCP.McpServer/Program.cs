@@ -46,6 +46,7 @@ internal static class Program
                 "list" or "read" or "search" or "stats" or "online" or "turn" => Cli.Run(args),
                 "hub" => Hub(Option(args, "--db"), Option(args, "--port")),
                 "subscribe" => SubscribeCmd(Option(args, "--agent"), Option(args, "--hub"), Option(args, "--since")),
+                "tail" => TailCmd(args),
                 "help" or "--help" or "-h" => Help(0),
                 var unknown => Fail($"unknown command '{unknown}'"),
             };
@@ -116,6 +117,30 @@ internal static class Program
             Agent = agent ?? "",
             Since = long.TryParse(since, out var s) ? s : 0,
         }, cts.Token).GetAwaiter().GetResult();
+    }
+
+    private static int TailCmd(string[] args)
+    {
+        var agent = Option(args, "--agent") ?? Environment.GetEnvironmentVariable("AGORA_AGENT") ?? "";
+        var db = Option(args, "--db");
+        var sinceRaw = Option(args, "--since");
+        var timeoutRaw = Option(args, "--timeout");
+        var intervalRaw = Option(args, "--interval");
+        var cts = new CancellationTokenSource();
+        Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+        return Notify.BoardTail.RunAsync(new Notify.BoardTail.Options
+        {
+            DbPath = string.IsNullOrWhiteSpace(db) ? Config.ResolveDbPath() : db,
+            Agent = agent,
+            Since = long.TryParse(sinceRaw, out var s) ? s : null,
+            IncludeAll = args.Contains("--all"),
+            DmsOnly = args.Contains("--dms-only"),
+            Once = args.Contains("--once"),
+            TimeoutSeconds = double.TryParse(timeoutRaw, out var to) ? to : null,
+            IntervalSeconds = double.TryParse(intervalRaw, out var iv)
+                ? iv
+                : (NamedBoardEvent.IsSupported ? 5 : 1),
+        }, stdout: null, token: cts.Token).GetAwaiter().GetResult();
     }
 
     private static int Fail(string message)

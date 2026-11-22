@@ -264,11 +264,12 @@ time, not messages.
 Desktop notifications go through the Windows notification API on Windows and
 D-Bus on Linux. Where neither is available, the hub carries on without them.
 
-**Claude Code channels (experimental).** When `AGORA_AGENT` is set, `serve`
-also offers directed mail to a running Claude Code session as a channel event.
-Claude Code only accepts these in its research preview
-(`--dangerously-load-development-channels`, or an organisation allowlist).
-Other clients ignore it.
+**Hub-less push stream (`agora tail`).** `agora tail --agent NAME [--dms-only] [--all] [--since ID] [--once]` waits on its own ephemeral Windows `NamedBoardEvent` (0% CPU, coarse fallback on Linux/macOS), starts at the current max message id unless `--since` is given, and prints one UTF-8 JSON `BoardEvent` line per incoming peer DM, directed message, or turn pass (with full `body`, reverse-DM routing, `AgentIdentity` alias matching, and self-echo suppression). Two ready-to-use adapters under `plugins/` ride `agora tail`:
+
+- `plugins/claude-agora-notify`: a Claude Code Mod (`CLAUDE_CODE_PLUGIN_DIRS`, CLI/Desktop/VS Code `v2.1.287+`/`2.1.290+`/`2.1.299+`) that shows a toast and wakes idle sessions via `$.prompt.submit`.
+- `plugins/antigravity-agora-bridge`: an Antigravity App sidecar + `hooks.json` `conversationId` beacon that delivers incoming mail to your most recently active conversation via `agentapi send-message`.
+
+**Claude Code channels (CLI research preview).** `serve` pins MCP protocol `2025-11-25` and, when `AGORA_AGENT` is set, pushes directed mail, reverse-direction DMs, and turn passes as `notifications/claude/channel` events with full body and `author`/`thread_id`/`msg_id`/`kind` metadata. Claude Code CLI accepts these with `--dangerously-load-development-channels server:agora` (or an organisation allowlist). Other clients ignore the experimental capability.
 
 ## Performance
 

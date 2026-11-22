@@ -77,6 +77,19 @@ public static class NamedBoardEvent
         }
     }
 
+    /// <summary>Watcher side: remove this listener's event file on clean exit. Never throws.</summary>
+    public static void Unregister(string dbPath, string agent)
+    {
+        if (!IsSupported) return;
+        try
+        {
+            var file = EventFileFor(dbPath, agent);
+            if (File.Exists(file)) File.Delete(file);
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+    }
+
     /// <summary>Per-agent event file name: readable slug plus the agent hash, so "a-b" and "a_b" get distinct files.</summary>
     public static string EventFileFor(string dbPath, string agent)
     {
@@ -93,6 +106,7 @@ public static class NamedBoardEvent
         {
             var dir = EventsDirectoryFor(dbPath);
             if (!Directory.Exists(dir)) return;
+            var staleCutoff = DateTime.UtcNow.AddMinutes(-2);
             foreach (var file in Directory.EnumerateFiles(dir, "*.event"))
             {
                 try
@@ -102,12 +116,26 @@ public static class NamedBoardEvent
                     using var handle = EventWaitHandle.OpenExisting(name);
                     handle.Set();
                 }
-                catch (Exception e) when (e is WaitHandleCannotBeOpenedException
-                                             or UnauthorizedAccessException
-                                             or IOException)
+                catch (WaitHandleCannotBeOpenedException)
                 {
-                    // Unreadable file or a watcher that is not up right now:
-                    // skip it; its coarse wait will catch up when it returns.
+                    // Listener is not up right now. Prune orphaned ephemeral tail/channel
+                    // event files so crashed sessions do not accumulate files forever.
+                    var leaf = Path.GetFileName(file);
+                    if (leaf.StartsWith("tail-", StringComparison.OrdinalIgnoreCase) ||
+                        leaf.StartsWith("channel-", StringComparison.OrdinalIgnoreCase))
+                    {
+                        try
+                        {
+                            if (File.GetLastWriteTimeUtc(file) < staleCutoff)
+                                File.Delete(file);
+                        }
+                        catch (IOException) { }
+                        catch (UnauthorizedAccessException) { }
+                    }
+                }
+                catch (Exception e) when (e is UnauthorizedAccessException or IOException)
+                {
+                    // Unreadable file: skip it; listener's coarse wait catches up.
                 }
             }
         }

@@ -59,6 +59,8 @@ internal sealed class McpStdioClient : IDisposable
     private string Diagnostics =>
         $"server {(_process.HasExited ? $"exited code={_process.ExitCode}" : "still running")}, stderr: {StderrTail}";
 
+    public JsonElement InitializeResult { get; }
+
     public McpStdioClient(string dbPath, string? agentEnv = null)
     {
         var psi = new ProcessStartInfo
@@ -90,11 +92,11 @@ internal sealed class McpStdioClient : IDisposable
 
         Send(new { jsonrpc = "2.0", id = _nextId++, method = "initialize", @params = new
         {
-            protocolVersion = "2024-11-05",
+            protocolVersion = "2025-11-25",
             capabilities = new { },
             clientInfo = new { name = "agora-tests", version = "0" },
         } });
-        ReadResult(_nextId - 1);
+        InitializeResult = ReadResult(_nextId - 1);
 
         // A notification (no id) — no response is sent for it.
         _process.StandardInput.WriteLine(
@@ -216,7 +218,7 @@ internal sealed class McpStdioClient : IDisposable
                 catch (JsonException) { }
             }
         });
-        return !read.Wait(TimeSpan.FromSeconds(seconds)) || read.Result;
+        return !read.Wait(TimeSpan.FromSeconds(seconds)) || !read.Result;
     }
 
     private void Send(object message)

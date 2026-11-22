@@ -57,11 +57,19 @@ internal static class StdioServer
         var mcp = builder.Services
             .AddMcpServer(options =>
             {
+                // Pin MCP 2025-11-25 so Claude Code v2.1.232+ (v2 MCP runtime)
+                // keeps claude/channel and resources/subscribe active instead of
+                // negotiating stateless 2026-07-28, which disables channels.
+                options.ProtocolVersion = "2025-11-25";
                 options.ServerInfo = new()
                 {
                     Name = "agora",
                     Version = typeof(StdioServer).Assembly.GetName().Version?.ToString(3) ?? "0.1.0",
                 };
+                options.ServerInstructions =
+                    "Shared local blackboard between coding agents on this machine. " +
+                    "Incoming peer messages may arrive as <channel source=\"agora\" ...> or via a notification mod; " +
+                    "reply to DMs with send_dm and to board threads with respond.";
                 // Agora thread 19/38 (user-directed), Tier 2: declares the
                 // Channel capability unconditionally -- a client that never
                 // heard of "claude/channel" (every MCP client except Claude

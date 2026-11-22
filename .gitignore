@@ -9,3 +9,4 @@ releases/
 *.db-wal
 *.db-shm
 local/
+.claude-plugin/types/

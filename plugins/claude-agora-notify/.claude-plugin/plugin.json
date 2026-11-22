@@ -1,0 +1,8 @@
+{
+  "name": "agora-notify",
+  "version": "0.1.0",
+  "description": "Pushes incoming Agora DMs and directed board messages directly into live/idle Claude Code sessions (CLI, Desktop, VS Code) via agora tail.",
+  "author": {
+    "name": "ContradNamiseb"
+  }
+}

@@ -22,7 +22,8 @@ public sealed record BoardEvent(
     [property: JsonPropertyName("author")] string Author,
     [property: JsonPropertyName("topic")] string Topic,
     [property: JsonPropertyName("directed_to")] string DirectedTo,
-    [property: JsonPropertyName("at")] string CreatedAt);
+    [property: JsonPropertyName("at")] string CreatedAt,
+    [property: JsonPropertyName("body")] string Body = "");
 
 /// <summary>
 /// In-binary push fan-out: a resident loopback SSE hub. No scripts, no
@@ -251,7 +252,7 @@ public static class NotifyHub
                     foreach (var sub in subscribers.Values)
                     {
                         if (seq <= sub.Cursor) continue;
-                        if (sub.Agent.Length > 0 && to.Length > 0 && to != sub.Agent) continue;
+                        if (sub.Agent.Length > 0 && to.Length > 0 && !AgentIdentity.AnswersTo(sub.Agent, to)) continue;
                         sub.Queue.Add(line);
                         sub.Cursor = seq;
                     }
@@ -266,21 +267,49 @@ public static class NotifyHub
         }
     }
 
-    private static long ReadMaxSeq(string dbPath)
+    internal static long ReadMaxSeq(string dbPath)
     {
         using var db = AgoraDatabase.Open(dbPath);
         return db.Scalar<long>("SELECT COALESCE(MAX(id), 0) FROM messages");
     }
 
-    internal static List<(string Line, long Seq, string To, string Author, string Topic)> ReadSince(
-        string dbPath, long since, string agent)
+    /// <summary>
+    /// Computes the true recipient of a message:
+    /// - On DM threads (one shared thread per pair, where threads.directed_to
+    ///   stays frozen as the initial recipient), the recipient is whichever party
+    ///   (created_by or directed_to) is NOT the message author.
+    /// - On board threads, threads.directed_to wins; if the thread is open
+    ///   (directed_to empty) and a turn pass handed the thread to another agent,
+    ///   the current turn holder is the recipient.
+    /// </summary>
+    internal static string EffectiveRecipient(
+        string threadKind, string createdBy, string directedTo, string turnHolder, string author)
     {
-        // Agent filter here is a bandwidth courtesy only (directed mail to
-        // someone else is skipped for named subscribers); correctness never
-        // depends on it because the pump re-checks per subscriber.
+        if (string.Equals(threadKind, DmStore.ThreadKind, StringComparison.OrdinalIgnoreCase))
+        {
+            if (AgentIdentity.AnswersTo(createdBy, author)) return directedTo;
+            if (AgentIdentity.AnswersTo(directedTo, author)) return createdBy;
+            return directedTo;
+        }
+        if (directedTo.Length > 0) return directedTo;
+        if (turnHolder.Length > 0 && !AgentIdentity.AnswersTo(turnHolder, author)) return turnHolder;
+        return "";
+    }
+
+    internal static (List<BoardEvent> Events, long MaxSeq) ReadEventsSince(
+        string dbPath,
+        long since,
+        string agent,
+        bool directedOnly = false,
+        bool dmsOnly = false,
+        bool excludeSelf = false)
+    {
         using var db = AgoraDatabase.Open(dbPath);
         var rows = db.Prepare("""
-            SELECT m.id, m.thread_id, m.author, m.kind, t.topic, t.directed_to, m.created_at
+            SELECT m.id, m.thread_id, m.author, m.kind, m.body,
+                   t.topic, t.created_by, t.directed_to, t.kind AS thread_kind,
+                   COALESCE((SELECT te.to_agent FROM turn_events te WHERE te.thread_id = t.id ORDER BY te.id DESC LIMIT 1), '') AS turn_holder,
+                   m.created_at
             FROM messages m
             JOIN threads t ON t.id = m.thread_id
             WHERE m.id > $since
@@ -293,16 +322,50 @@ public static class NotifyHub
                 ThreadId: r.GetInt64("thread_id"),
                 Author: r.GetString("author"),
                 Kind: r.GetString("kind"),
+                Body: r.GetString("body"),
                 Topic: r.GetString("topic"),
+                CreatedBy: r.GetString("created_by"),
                 DirectedTo: r.GetString("directed_to"),
+                ThreadKind: r.GetString("thread_kind"),
+                TurnHolder: r.GetString("turn_holder"),
                 At: r.GetString("created_at")));
-        var outList = new List<(string, long, string, string, string)>();
+
+        var maxSeq = since;
+        var events = new List<BoardEvent>();
+        var target = agent.Trim();
         foreach (var r in rows)
         {
-            if (agent.Length > 0 && r.DirectedTo.Length > 0 && r.DirectedTo != agent) continue;
-            var ev = new BoardEvent(r.Seq, r.Kind, r.ThreadId, r.Seq, r.Author, r.Topic, r.DirectedTo, r.At);
-            outList.Add((JsonSerializer.Serialize(ev), r.Seq, r.DirectedTo, r.Author, r.Topic));
+            if (r.Seq > maxSeq) maxSeq = r.Seq;
+            var isDm = string.Equals(r.ThreadKind, DmStore.ThreadKind, StringComparison.OrdinalIgnoreCase);
+            if (dmsOnly && !isDm) continue;
+
+            var effectiveTo = EffectiveRecipient(r.ThreadKind, r.CreatedBy, r.DirectedTo, r.TurnHolder, r.Author);
+            if (target.Length > 0)
+            {
+                if (excludeSelf && AgentIdentity.AnswersTo(target, r.Author)) continue;
+                if (directedOnly)
+                {
+                    if (effectiveTo.Length == 0 || !AgentIdentity.AnswersTo(target, effectiveTo)) continue;
+                }
+                else
+                {
+                    if (effectiveTo.Length > 0 && !AgentIdentity.AnswersTo(target, effectiveTo)) continue;
+                }
+            }
+
+            var kind = isDm ? DmStore.MessageKind : r.Kind;
+            events.Add(new BoardEvent(r.Seq, kind, r.ThreadId, r.Seq, r.Author, r.Topic, effectiveTo, r.At, r.Body));
         }
+        return (events, maxSeq);
+    }
+
+    internal static List<(string Line, long Seq, string To, string Author, string Topic)> ReadSince(
+        string dbPath, long since, string agent)
+    {
+        var (events, _) = ReadEventsSince(dbPath, since, agent);
+        var outList = new List<(string, long, string, string, string)>(events.Count);
+        foreach (var ev in events)
+            outList.Add((JsonSerializer.Serialize(ev), ev.Seq, ev.DirectedTo, ev.Author, ev.Topic));
         return outList;
     }
 }

@@ -1,0 +1,11 @@
+{
+  "display_name": "Agora DM Bridge",
+  "description": "Watches Agora via agora tail and pushes incoming DMs and directed messages into the most recently active Antigravity conversation via agentapi.",
+  "command": "node",
+  "args": ["bridge.mjs"],
+  "restart_policy": "always",
+  "env": {
+    "AGORA_EXE": "agora",
+    "AGORA_AGENT": "antigravity"
+  }
+}

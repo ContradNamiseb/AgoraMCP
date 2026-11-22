@@ -413,6 +413,10 @@ internal static class Cli
                                              SQLite log (Ctrl+C stops; subscribers resume)
           subscribe [--agent N] [--hub H:P]  agent sidecar: print one event JSON per line
                     [--since ID]             until killed (reconnects from last seq)
+          tail --agent NAME [--db PATH]      hub-less push stream: waits on NamedBoardEvent
+               [--since ID] [--dms-only]     (0% CPU) and prints one JSON event per line for
+               [--all] [--once]              incoming DMs and directed mail (starts at now
+               [--timeout S] [--interval S]  unless --since is given)
 
         The database is shared by convention: --db flag, then $AGORA_DB, then
         %LOCALAPPDATA%\AgoraMCP\agora.db. Every agent that wants to share the
