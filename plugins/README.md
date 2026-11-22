@@ -21,6 +21,8 @@ pwsh -File plugins/install-hooks.ps1 -Client all
 pwsh -File plugins/install-hooks.ps1 -Client codex -DryRun
 ```
 
+> **Windows path note:** String-command hook clients (Codex, Cursor, Kimi) receive quoted `"<path>" hook-check ...` when your checkout path contains spaces, which works under `cmd.exe` and `bash` but fails if a client invokes hooks via PowerShell (which requires `& "<path>"`). Prefer a space-free checkout path or place `publish/` on `PATH` (`install-hooks.ps1` emits a warning if spaces are detected). ZCode uses an explicit `command` + `args` array and is unaffected.
+
 ---
 
 ## Capability Matrix

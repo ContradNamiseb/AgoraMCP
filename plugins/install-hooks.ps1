@@ -7,7 +7,8 @@
   `agora` so git stays free of machine-specific paths. This script merges those
   hooks into your user config directories using the absolute path to
   `<repo>/publish/agora.exe` (or an explicit `-AgoraExe`), preserving any existing
-  hooks and backing up every modified file before writing.
+  hooks, skipping unchanged files (no duplicate backups on re-run), and backing
+  up every modified file before writing.
 
 .EXAMPLE
   pwsh -File plugins/install-hooks.ps1 -Client all
@@ -35,6 +36,8 @@ if (-not (Test-Path -LiteralPath $AgoraExe)) {
 $targetHome = if ([string]::IsNullOrWhiteSpace($HomeDir)) { $HOME } else { $HomeDir }
 $utf8 = [Text.UTF8Encoding]::new($false)
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$hasSpaces = $AgoraExe -match '\s'
+$warnedSpacePath = $false
 
 function Backup-IfExists([string]$path) {
     if ((Test-Path -LiteralPath $path) -and -not $DryRun) {
@@ -46,10 +49,20 @@ function Should-Install([string]$name) {
     return ($Client -eq 'all' -or $Client -eq $name)
 }
 
-function Format-CommandString([string]$exe, [string]$hookArgs) {
-    # Quote executable path whenever it contains whitespace so spaces in repo
-    # paths never split the command string (I2).
+function Warn-SpacePathOnce([string]$clientName) {
+    if ($hasSpaces -and -not $script:warnedSpacePath) {
+        $script:warnedSpacePath = $true
+        Write-Warning (
+            "AgoraExe path '$AgoraExe' contains whitespace. String-command hooks ($clientName) are quoted as " +
+            '"<path>" hook-check ..., which works under cmd.exe and bash, but fails if a client invokes hooks via ' +
+            'PowerShell (which requires & "<path>"). Prefer a space-free path or put publish/ on PATH.'
+        )
+    }
+}
+
+function Format-CommandString([string]$exe, [string]$hookArgs, [string]$clientName) {
     if ($exe -match '\s') {
+        Warn-SpacePathOnce $clientName
         return "`"$exe`" $hookArgs"
     }
     return "$exe $hookArgs"
@@ -64,6 +77,23 @@ function Ensure-Property($obj, [string]$name, $defaultValue) {
         $obj | Add-Member -NotePropertyName $name -NotePropertyValue $defaultValue
     }
     return $obj.$name
+}
+
+# Returns $true if the file differs from $content (and writes + backs up unless -DryRun);
+# returns $false when already byte-identical so re-runs never pile up .bak files (O1).
+function Sync-FileIfChanged([string]$path, [string]$content) {
+    if (Test-Path -LiteralPath $path) {
+        $current = [IO.File]::ReadAllText($path, $utf8)
+        if ($current -ceq $content) {
+            return $false
+        }
+    }
+    if (-not $DryRun) {
+        New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
+        Backup-IfExists $path
+        [IO.File]::WriteAllText($path, $content, $utf8)
+    }
+    return $true
 }
 
 if (Should-Install 'codex') {
@@ -84,7 +114,7 @@ if (Should-Install 'codex') {
         $existing = if ($hooksObj.PSObject.Properties[$ev.Name]) { @($hooksObj.$($ev.Name)) } else { @() }
         if (($existing | ConvertTo-Json -Depth 6) -match 'hook-check\s+--agent\s+codex') { continue }
         $flag = if ($ev.Record) { ' --record-session' } else { '' }
-        $cmdStr = Format-CommandString $AgoraExe "hook-check --agent codex --format codex --event $($ev.Name)$flag"
+        $cmdStr = Format-CommandString $AgoraExe "hook-check --agent codex --format codex --event $($ev.Name)$flag" 'codex'
         $entry = [PSCustomObject]@{
             hooks = @(
                 [PSCustomObject]@{
@@ -128,7 +158,7 @@ if (Should-Install 'cursor') {
         $existing = if ($hooksObj.PSObject.Properties[$ev.Name]) { @($hooksObj.$($ev.Name)) } else { @() }
         if (($existing | ConvertTo-Json -Depth 6) -match 'hook-check\s+--agent\s+cursor') { continue }
         $flag = if ($ev.Record) { ' --record-session' } else { '' }
-        $cmdStr = Format-CommandString $AgoraExe "hook-check --agent cursor --format cursor --event $($ev.Name)$flag"
+        $cmdStr = Format-CommandString $AgoraExe "hook-check --agent cursor --format cursor --event $($ev.Name)$flag" 'cursor'
         $entry = [PSCustomObject]@{ command = $cmdStr }
         $merged = @($existing) + @($entry)
         if ($hooksObj.PSObject.Properties[$ev.Name]) { $hooksObj.$($ev.Name) = $merged }
@@ -150,13 +180,12 @@ if (Should-Install 'cursor') {
 if (Should-Install 'opencode') {
     $dst = Join-Path $targetHome '.config\opencode\plugins\agora-ping.js'
     $escapedJs = $AgoraExe.Replace('\', '\\').Replace('"', '\"')
-    $src = (Get-Content (Join-Path $PSScriptRoot 'opencode-agora-notify\agora-ping.js') -Raw).Replace('return "agora";', "return `"$escapedJs`";")
-    if ($DryRun) { Write-Output "[dry-run] would write $dst using $AgoraExe" }
-    else {
-        New-Item -ItemType Directory -Path (Split-Path -Parent $dst) -Force | Out-Null
-        Backup-IfExists $dst
-        [IO.File]::WriteAllText($dst, $src, $utf8)
-        Write-Output "installed $dst"
+    $src = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'opencode-agora-notify\agora-ping.js'), $utf8).Replace('return "agora";', "return `"$escapedJs`";")
+    if (Sync-FileIfChanged $dst $src) {
+        if ($DryRun) { Write-Output "[dry-run] would update $dst using $AgoraExe" }
+        else { Write-Output "installed $dst" }
+    } else {
+        Write-Output "opencode plugin already up to date in $dst"
     }
 }
 
@@ -165,20 +194,23 @@ if (Should-Install 'antigravity') {
     $bridgeDst = Join-Path $dir 'bridge.mjs'
     $beaconDst = Join-Path $dir 'beacon.mjs'
     $sidecarDst = Join-Path $dir 'sidecar.json'
-    if ($DryRun) { Write-Output "[dry-run] would back up and sync bridge.mjs, beacon.mjs, sidecar.json to $dir using $AgoraExe" }
-    else {
-        New-Item -ItemType Directory -Path $dir -Force | Out-Null
-        Backup-IfExists $bridgeDst
-        Backup-IfExists $beaconDst
-        Backup-IfExists $sidecarDst
-        Copy-Item (Join-Path $PSScriptRoot 'antigravity-agora-bridge\bridge.mjs') $bridgeDst -Force
-        Copy-Item (Join-Path $PSScriptRoot 'antigravity-agora-bridge\beacon.mjs') $beaconDst -Force
-        $scObj = Get-Content (Join-Path $PSScriptRoot 'antigravity-agora-bridge\sidecar.json') -Raw | ConvertFrom-Json
-        $envObj = Ensure-Property $scObj 'env' ([PSCustomObject]@{})
-        if ($envObj.PSObject.Properties['AGORA_EXE']) { $envObj.AGORA_EXE = $AgoraExe }
-        else { $envObj | Add-Member -NotePropertyName AGORA_EXE -NotePropertyValue $AgoraExe }
-        [IO.File]::WriteAllText($sidecarDst, ($scObj | ConvertTo-Json -Depth 8) + "`n", $utf8)
-        Write-Output "installed $dir"
+
+    $bridgeContent = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'antigravity-agora-bridge\bridge.mjs'), $utf8)
+    $beaconContent = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'antigravity-agora-bridge\beacon.mjs'), $utf8)
+    $escapedJsonExe = $AgoraExe.Replace('\', '\\').Replace('"', '\"')
+    $sidecarContent = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'antigravity-agora-bridge\sidecar.json'), $utf8).Replace('"AGORA_EXE": "agora"', "`"AGORA_EXE`": `"$escapedJsonExe`"")
+
+    $updatedFiles = @()
+    if (Sync-FileIfChanged $bridgeDst $bridgeContent) { $updatedFiles += 'bridge.mjs' }
+    if (Sync-FileIfChanged $beaconDst $beaconContent) { $updatedFiles += 'beacon.mjs' }
+    if (Sync-FileIfChanged $sidecarDst $sidecarContent) { $updatedFiles += 'sidecar.json' }
+
+    if ($updatedFiles.Count -eq 0) {
+        Write-Output "antigravity sidecar already up to date in $dir"
+    } elseif ($DryRun) {
+        Write-Output "[dry-run] would back up and update $($updatedFiles -join ', ') in $dir using $AgoraExe"
+    } else {
+        Write-Output "updated $($updatedFiles -join ', ') in $dir"
     }
 }
 
@@ -191,11 +223,12 @@ if (Should-Install 'kimi') {
         if ($text -match 'hook-check --agent kimicode') {
             Write-Output "kimi hooks already present in $dst"
         } elseif ($DryRun) {
+            if ($hasSpaces) { Warn-SpacePathOnce 'kimi' }
             Write-Output "[dry-run] would append [[hooks]] to $dst using $AgoraExe"
         } else {
             Backup-IfExists $dst
-            $promptCmd = Escape-TomlBasicString (Format-CommandString $AgoraExe 'hook-check --agent kimicode --format kimi --event UserPromptSubmit --record-session')
-            $stopCmd = Escape-TomlBasicString (Format-CommandString $AgoraExe 'hook-check --agent kimicode --format kimi --event Stop')
+            $promptCmd = Escape-TomlBasicString (Format-CommandString $AgoraExe 'hook-check --agent kimicode --format kimi --event UserPromptSubmit --record-session' 'kimi')
+            $stopCmd = Escape-TomlBasicString (Format-CommandString $AgoraExe 'hook-check --agent kimicode --format kimi --event Stop' 'kimi')
             $snippet = @"
 [[hooks]]
 event = "UserPromptSubmit"
