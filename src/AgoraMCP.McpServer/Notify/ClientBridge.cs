@@ -1,39 +1,39 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using AgoraMCP.McpServer.Watch;
 
 namespace AgoraMCP.McpServer.Notify;
 
 /// <summary>
 /// Hub-less, zero-CPU idle-wake dispatcher (`agora bridge`): waits on its own
-/// ephemeral <see cref="NamedBoardEvent"/> and delivers incoming peer DMs and
-/// directed board messages into sanctioned client-native local APIs:
+/// ephemeral <see cref="NamedBoardEvent"/> and delivers incoming peer DMs,
+/// directed board messages, and turn passes into sanctioned client-native local APIs:
 ///
 /// <list type="bullet">
-///   <item><c>codex</c>: <c>codex queue --thread &lt;id&gt; --message &lt;text&gt;</c> (Codex CLI 0.153+)</item>
+///   <item><c>codex</c>: <c>codex queue --thread &lt;id&gt; --message &lt;text&gt;</c> (native .exe only; refuses .cmd/.bat wrappers)</item>
 ///   <item><c>kimi-web</c>: <c>POST /api/v1/sessions/{id}/prompts</c> on local <c>kimi web</c> (Bearer token)</item>
-///   <item><c>opencode</c>: <c>opencode api POST /session/{id}/prompt_async</c> or direct HTTP when <c>--url</c> is set</item>
+///   <item><c>opencode</c>: <c>POST /session/{id}/prompt_async</c> over local HTTP (default http://127.0.0.1:4096 + service.json Basic auth)</item>
 /// </list>
 ///
-/// <para>Active session/thread IDs are discovered from <c>--session</c>, from the
-/// beacon file written by <c>agora hook-check --record-session</c>
-/// (<c>%LOCALAPPDATA%\AgoraMCP\sessions\&lt;agent&gt;.json</c>), or via client-specific
-/// read-only discovery (Codex latest session rollout UUID / Kimi Web <c>GET /api/v1/sessions</c>).</para>
+/// <para>Requires either an explicit <c>--session</c> or a fresh active-session
+/// beacon written by <c>agora hook-check --record-session</c>
+/// (<c>%LOCALAPPDATA%\AgoraMCP\sessions\&lt;agent&gt;.json</c>); never guesses an
+/// unrelated session from disk or server listings.</para>
 /// </summary>
-public static partial class ClientBridge
+public static class ClientBridge
 {
     public const string DefaultKimiWebUrl = "http://127.0.0.1:58627";
+    public const string DefaultOpenCodeUrl = "http://127.0.0.1:4096";
+    public const double DefaultSessionMaxAgeSeconds = 4 * 60 * 60; // 4 hours
+    public const double DefaultWakeCooldownSeconds = 60 * 60; // 60 min loop-breaker latch
 
     private static readonly HttpClient SharedHttp = new()
     {
         Timeout = TimeSpan.FromSeconds(15),
     };
-
-    [GeneratedRegex(@"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", RegexOptions.CultureInvariant)]
-    private static partial Regex UuidRegex();
 
     public sealed record Options
     {
@@ -46,16 +46,18 @@ public static partial class ClientBridge
         public string? SessionId { get; init; }
         /// <summary>Optional active-session beacon JSON path (defaults to HookCheck.DefaultSessionPath).</summary>
         public string? SessionFilePath { get; init; }
+        /// <summary>Reject beacon files older than this many seconds (0 = no expiry; default 4h).</summary>
+        public double SessionMaxAgeSeconds { get; init; } = DefaultSessionMaxAgeSeconds;
         /// <summary>Optional HTTP server URL (kimi-web / opencode).</summary>
         public string? ServerUrl { get; init; }
         /// <summary>Optional Bearer token override (kimi-web) or Basic password (opencode).</summary>
         public string? AuthToken { get; init; }
-        /// <summary>Optional CLI executable path override (codex / opencode).</summary>
+        /// <summary>Optional CLI executable path override (codex; .cmd/.bat wrappers are refused).</summary>
         public string? ExecutablePath { get; init; }
         /// <summary>Optional Kimi home directory override (for testing; defaults to ~/.kimi-code).</summary>
         public string? KimiHomeDir { get; init; }
-        /// <summary>Optional Codex home directory override (for testing; defaults to ~/.codex).</summary>
-        public string? CodexHomeDir { get; init; }
+        /// <summary>Optional OpenCode config directory override (for testing; defaults to ~/.config/opencode).</summary>
+        public string? OpenCodeConfigDir { get; init; }
         public long? Since { get; init; }
         public long? SinceTurn { get; init; }
         public bool IncludeAll { get; init; }
@@ -64,10 +66,18 @@ public static partial class ClientBridge
         public bool DryRun { get; init; }
         public double? TimeoutSeconds { get; init; }
         public double IntervalSeconds { get; init; } = NamedBoardEvent.IsSupported ? 5 : 1;
-        /// <summary>Per-thread sliding-window wake cap (0 = unlimited). Prevents agent ping-pong loops.</summary>
+        /// <summary>Per-thread wake cap before latching into cooldown (0 = unlimited).</summary>
         public int MaxWakesPerThread { get; init; } = 6;
-        /// <summary>Sliding window duration in seconds for <see cref="MaxWakesPerThread"/>.</summary>
+        /// <summary>Window duration in seconds for counting wakes toward <see cref="MaxWakesPerThread"/>.</summary>
         public double WakeWindowSeconds { get; init; } = 600;
+        /// <summary>Latch duration in seconds once a thread trips <see cref="MaxWakesPerThread"/>.</summary>
+        public double WakeCooldownSeconds { get; init; } = DefaultWakeCooldownSeconds;
+        /// <summary>Exit cleanly if this parent PID exits.</summary>
+        public int? ParentPid { get; init; }
+        /// <summary>Auto-detect own parent PID on Windows/Linux and exit cleanly if it terminates.</summary>
+        public bool ExitWithParent { get; init; }
+        /// <summary>Exit cleanly when stdin reaches EOF.</summary>
+        public bool ExitOnStdinEof { get; init; }
     }
 
     public sealed record DispatchRequest(
@@ -115,6 +125,23 @@ public static partial class ClientBridge
             ? DefaultAgentForClient(client)
             : options.Agent.Trim();
 
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+        var linkedToken = linkedCts.Token;
+
+        Process? watchedParent = null;
+        var targetParentPid = options.ParentPid
+            ?? (options.ExitWithParent ? BoardTail.TryGetOwnParentPid() : null);
+
+        if (targetParentPid is > 0)
+        {
+            if (!BoardTail.TryAttachParentWatcher(targetParentPid.Value, linkedCts, out watchedParent))
+                return 0;
+        }
+        if (options.ExitOnStdinEof)
+        {
+            _ = BoardTail.WatchStdinEofAsync(linkedCts);
+        }
+
         var dbPath = Path.GetFullPath(options.DbPath);
         var listenerId = $"bridge-{client}-{HookCheck.SanitizeFileSegment(agent)}-{Environment.ProcessId}-{Guid.NewGuid().ToString("N")[..8]}";
         EventWaitHandle? ownEvent = null;
@@ -141,15 +168,19 @@ public static partial class ClientBridge
                 : (DateTime?)null;
             var fallback = TimeSpan.FromSeconds(Math.Clamp(options.IntervalSeconds, 0.1, 60));
             var wakeHistory = new Dictionary<long, Queue<DateTime>>();
+            var latchedUntil = new Dictionary<long, DateTime>();
 
             err.WriteLine($"bridge: watching '{agent}' for client '{client}' (cursor={cursor}, turn={turnCursor}, db={dbPath}{(options.DryRun ? ", dry-run" : "")})");
             err.Flush();
 
             var firstPass = true;
-            while (!token.IsCancellationRequested)
+            while (!linkedToken.IsCancellationRequested)
             {
                 if (!firstPass)
                 {
+                    if (watchedParent is not null && BoardTail.SafeHasExited(watchedParent))
+                        return 0;
+
                     var wait = fallback;
                     if (deadline is { } dl)
                     {
@@ -159,7 +190,7 @@ public static partial class ClientBridge
                     }
                     try
                     {
-                        await ChannelBridge.WaitForWakeAsync(ownEvent, wait, token);
+                        await ChannelBridge.WaitForWakeAsync(ownEvent, wait, linkedToken);
                     }
                     catch (OperationCanceledException)
                     {
@@ -167,6 +198,9 @@ public static partial class ClientBridge
                     }
                 }
                 firstPass = false;
+
+                if (watchedParent is not null && BoardTail.SafeHasExited(watchedParent))
+                    return 0;
 
                 try
                 {
@@ -184,8 +218,12 @@ public static partial class ClientBridge
 
                     if (events.Count > 0)
                     {
-                        var deliverable = FilterByWakeCap(events, wakeHistory, options.MaxWakesPerThread,
-                            TimeSpan.FromSeconds(Math.Max(1, options.WakeWindowSeconds)), err, client);
+                        var window = TimeSpan.FromSeconds(Math.Max(1, options.WakeWindowSeconds));
+                        var cooldown = TimeSpan.FromSeconds(Math.Max(1, options.WakeCooldownSeconds));
+
+                        // Check cap without burning a slot yet — only record successful dispatches (L11).
+                        var deliverable = FilterByWakeCap(
+                            events, wakeHistory, latchedUntil, options.MaxWakesPerThread, window, cooldown, err, client);
                         if (deliverable.Count == 0)
                         {
                             if (options.Once) return 0;
@@ -193,22 +231,37 @@ public static partial class ClientBridge
                         }
 
                         var message = HookCheck.FormatEvents(deliverable);
-                        var sessionId = await ResolveTargetSessionAsync(client, agent, options, token);
+                        var (sessionId, sessionError) = ResolveTargetSession(agent, options);
+                        if (string.IsNullOrWhiteSpace(sessionId) && !options.DryRun && dispatcher is null)
+                        {
+                            err.WriteLine($"bridge [{client}]: skipped — {sessionError}; mail stays in pending queries.");
+                            err.Flush();
+                            if (options.Once) return 1;
+                            continue;
+                        }
+
                         var req = new DispatchRequest(client, agent, sessionId ?? "", message, deliverable);
 
                         DispatchResult res;
                         if (options.DryRun)
                         {
-                            res = new DispatchResult(true,
-                                $"dry-run: would deliver {deliverable.Count} event(s) to {client} session '{req.SessionId}'");
+                            var detail = string.IsNullOrWhiteSpace(req.SessionId)
+                                ? $"dry-run: {sessionError ?? "no session"}; would leave {deliverable.Count} event(s) in pending queries"
+                                : $"dry-run: would deliver {deliverable.Count} event(s) to {client} session '{req.SessionId}'";
+                            res = new DispatchResult(true, detail);
                         }
                         else if (dispatcher is not null)
                         {
-                            res = await dispatcher(req, token);
+                            res = await dispatcher(req, linkedToken);
                         }
                         else
                         {
-                            res = await DispatchAsync(req, options, token);
+                            res = await DispatchAsync(req, options, linkedToken);
+                        }
+
+                        if (res.Ok)
+                        {
+                            RecordSuccessfulWake(deliverable, wakeHistory, latchedUntil, options.MaxWakesPerThread, window, cooldown);
                         }
 
                         err.WriteLine($"bridge [{client}]: {(res.Ok ? "ok" : "warn")} — {res.Detail}");
@@ -235,28 +288,47 @@ public static partial class ClientBridge
                 NamedBoardEvent.Unregister(dbPath, listenerId);
                 ownEvent.Dispose();
             }
+            watchedParent?.Dispose();
         }
     }
 
-    public static async Task<string?> ResolveTargetSessionAsync(
-        string normalizedClient, string agent, Options options, CancellationToken token)
+    /// <summary>
+    /// Resolves the target session ONLY from an explicit <c>--session</c> or a
+    /// fresh beacon file (<c>--session-file</c> / <see cref="HookCheck.DefaultSessionPath"/>).
+    /// Never guesses an unrelated conversation from disk or server session lists (N9).
+    /// </summary>
+    public static (string? SessionId, string? Reason) ResolveTargetSession(string agent, Options options)
     {
         if (!string.IsNullOrWhiteSpace(options.SessionId))
-            return options.SessionId.Trim();
+            return (options.SessionId.Trim(), null);
 
         var sessionFile = string.IsNullOrWhiteSpace(options.SessionFilePath)
             ? HookCheck.DefaultSessionPath(agent)
             : options.SessionFilePath!;
-        var beacon = HookCheck.LoadSessionBeacon(sessionFile);
-        if (beacon is not null && !string.IsNullOrWhiteSpace(beacon.SessionId))
-            return beacon.SessionId.Trim();
-
-        return normalizedClient switch
+        if (!File.Exists(sessionFile))
         {
-            "codex" => DiscoverLatestCodexSessionId(options.CodexHomeDir),
-            "kimi-web" => await DiscoverLatestKimiWebSessionAsync(options, token),
-            _ => null,
-        };
+            return (null, $"no active session beacon at '{sessionFile}' (pass --session or enable --record-session hooks)");
+        }
+
+        var beacon = HookCheck.LoadSessionBeacon(sessionFile);
+        if (beacon is null || string.IsNullOrWhiteSpace(beacon.SessionId))
+        {
+            return (null, $"session beacon '{sessionFile}' has no valid session_id");
+        }
+
+        if (options.SessionMaxAgeSeconds > 0 && !string.IsNullOrWhiteSpace(beacon.UpdatedAt) &&
+            DateTimeOffset.TryParse(beacon.UpdatedAt, CultureInfo.InvariantCulture,
+                DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var updatedAt))
+        {
+            var age = DateTimeOffset.UtcNow - updatedAt;
+            if (age.TotalSeconds > options.SessionMaxAgeSeconds)
+            {
+                return (null,
+                    $"session beacon '{sessionFile}' is stale ({age.TotalMinutes:0}m old > {options.SessionMaxAgeSeconds / 60:0}m limit)");
+            }
+        }
+
+        return (beacon.SessionId.Trim(), null);
     }
 
     public static async Task<DispatchResult> DispatchAsync(
@@ -272,18 +344,93 @@ public static partial class ClientBridge
     public static IReadOnlyList<string> BuildCodexQueueArgs(string threadId, string message) =>
         ["queue", "--thread", threadId, "--message", message];
 
+    /// <summary>
+    /// Resolves a native executable path while strictly refusing Windows
+    /// <c>.cmd</c> / <c>.bat</c> batch wrappers (N1 / CVE-2024-27980 class),
+    /// because Windows launches batch files through <c>cmd.exe</c> where peer
+    /// message characters such as <c>&amp; | &gt; ^ %</c> and newlines break
+    /// quoting and allow command injection.
+    /// </summary>
+    public static (string? ResolvedPath, string? Error) ResolveSafeExecutable(string requestedExe)
+    {
+        var exe = (requestedExe ?? "").Trim();
+        if (exe.Length == 0)
+            return (null, "executable path is empty");
+
+        var ext = Path.GetExtension(exe);
+        if (ext.Equals(".cmd", StringComparison.OrdinalIgnoreCase) ||
+            ext.Equals(".bat", StringComparison.OrdinalIgnoreCase))
+        {
+            return (null,
+                $"refusing batch wrapper '{exe}' (.cmd/.bat executes through cmd.exe and is unsafe for untrusted peer text); " +
+                "pass the native .exe path via --exe or use HTTP --url.");
+        }
+
+        var hasSeparator = exe.Contains(Path.DirectorySeparatorChar) || exe.Contains(Path.AltDirectorySeparatorChar);
+        if (hasSeparator)
+        {
+            if (!File.Exists(exe))
+                return (null, $"executable not found: '{exe}'");
+            return (exe, null);
+        }
+
+        if (!OperatingSystem.IsWindows())
+            return (exe, null);
+
+        // Search PATH explicitly for a real .exe, skipping any .cmd/.bat npm shim.
+        var pathEnv = Environment.GetEnvironmentVariable("PATH") ?? "";
+        var dirs = pathEnv.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var sawBatchShim = (string?)null;
+        var hasExeExt = ext.Equals(".exe", StringComparison.OrdinalIgnoreCase);
+
+        foreach (var dir in dirs)
+        {
+            try
+            {
+                var exeCandidate = Path.Combine(dir, hasExeExt ? exe : exe + ".exe");
+                if (File.Exists(exeCandidate))
+                    return (exeCandidate, null);
+
+                if (!hasExeExt && sawBatchShim is null)
+                {
+                    var cmdCandidate = Path.Combine(dir, exe + ".cmd");
+                    if (File.Exists(cmdCandidate)) sawBatchShim = cmdCandidate;
+                    else
+                    {
+                        var batCandidate = Path.Combine(dir, exe + ".bat");
+                        if (File.Exists(batCandidate)) sawBatchShim = batCandidate;
+                    }
+                }
+            }
+            catch { }
+        }
+
+        if (sawBatchShim is not null)
+        {
+            return (null,
+                $"'{exe}' on PATH resolves only to batch wrapper '{sawBatchShim}'; refusing .cmd/.bat execution — " +
+                "pass the native .exe via --exe (or use HTTP --url).");
+        }
+
+        return (null, $"native executable '{exe}.exe' not found on PATH");
+    }
+
     internal static async Task<DispatchResult> DispatchCodexAsync(
         DispatchRequest request, Options options, CancellationToken token)
     {
         if (string.IsNullOrWhiteSpace(request.SessionId))
         {
             return new DispatchResult(false,
-                "no active Codex thread ID found (pass --session <UUID>, or install Codex hooks with --record-session)");
+                "no active Codex thread ID (pass --session <UUID>, or install Codex hooks with --record-session)");
         }
 
-        var exe = string.IsNullOrWhiteSpace(options.ExecutablePath) ? "codex" : options.ExecutablePath.Trim();
+        var requestedExe = string.IsNullOrWhiteSpace(options.ExecutablePath) ? "codex" : options.ExecutablePath.Trim();
+        var (safeExe, resolveErr) = ResolveSafeExecutable(requestedExe);
+        if (safeExe is null)
+            return new DispatchResult(false, resolveErr ?? "unable to resolve native codex executable");
+
         var args = BuildCodexQueueArgs(request.SessionId, request.Message);
-        var (exitCode, stdout, stderr) = await RunSubprocessAsync(exe, args, TimeSpan.FromSeconds(30), token);
+        var (exitCode, stdout, stderr) = await RunSubprocessAsync(safeExe, args, TimeSpan.FromSeconds(30), token);
         if (exitCode == 0)
             return new DispatchResult(true, $"queued {request.Events.Count} event(s) to codex thread {request.SessionId}");
 
@@ -295,19 +442,16 @@ public static partial class ClientBridge
     internal static async Task<DispatchResult> DispatchKimiWebAsync(
         DispatchRequest request, Options options, CancellationToken token)
     {
-        var baseUrl = ResolveKimiWebBaseUrl(options);
-        var bearer = ResolveKimiWebToken(options);
-        var sessionId = request.SessionId;
-        if (string.IsNullOrWhiteSpace(sessionId))
-            sessionId = await DiscoverLatestKimiWebSessionAsync(options, token) ?? "";
-
-        if (string.IsNullOrWhiteSpace(sessionId))
+        if (string.IsNullOrWhiteSpace(request.SessionId))
         {
             return new DispatchResult(false,
-                $"no active Kimi Web session found at {baseUrl} (start `kimi web` and open a session, or pass --session)");
+                "no active Kimi Web session ID (pass --session <id> or enable Kimi hooks with --record-session)");
         }
 
-        var endpoint = $"{baseUrl.TrimEnd('/')}/api/v1/sessions/{Uri.EscapeDataString(sessionId)}/prompts";
+        var baseUrl = ResolveKimiWebBaseUrl(options);
+        var bearer = ResolveKimiWebToken(options);
+
+        var endpoint = $"{baseUrl.TrimEnd('/')}/api/v1/sessions/{Uri.EscapeDataString(request.SessionId)}/prompts";
         var payload = JsonSerializer.Serialize(new
         {
             content = new[] { new { type = "text", text = request.Message } },
@@ -322,7 +466,7 @@ public static partial class ClientBridge
 
         using var resp = await SharedHttp.SendAsync(httpReq, token);
         if (resp.IsSuccessStatusCode)
-            return new DispatchResult(true, $"posted {request.Events.Count} event(s) to kimi-web session {sessionId} ({(int)resp.StatusCode})");
+            return new DispatchResult(true, $"posted {request.Events.Count} event(s) to kimi-web session {request.SessionId} ({(int)resp.StatusCode})");
 
         var body = await resp.Content.ReadAsStringAsync(token);
         return new DispatchResult(false,
@@ -335,43 +479,38 @@ public static partial class ClientBridge
         if (string.IsNullOrWhiteSpace(request.SessionId))
         {
             return new DispatchResult(false,
-                "no active OpenCode session ID found (prefer the native plugins/opencode-agora-notify plugin, or pass --session)");
+                "no active OpenCode session ID (prefer the native plugins/opencode-agora-notify plugin, or pass --session)");
         }
+
+        // Default to direct HTTP against opencode service (avoids Windows opencode.cmd
+        // batch-wrapper injection & newline truncation altogether).
+        var baseUrl = string.IsNullOrWhiteSpace(options.ServerUrl)
+            ? DefaultOpenCodeUrl
+            : options.ServerUrl.Trim().TrimEnd('/');
+        var password = ResolveOpenCodeServicePassword(options);
 
         var jsonBody = JsonSerializer.Serialize(new
         {
             parts = new[] { new { type = "text", text = request.Message } },
         });
 
-        // Direct HTTP when --url is given (works cleanly without Windows .cmd quoting issues).
-        if (!string.IsNullOrWhiteSpace(options.ServerUrl))
+        var endpoint = $"{baseUrl}/session/{Uri.EscapeDataString(request.SessionId)}/prompt_async";
+        using var httpReq = new HttpRequestMessage(HttpMethod.Post, endpoint)
         {
-            var endpoint = $"{options.ServerUrl.Trim().TrimEnd('/')}/session/{Uri.EscapeDataString(request.SessionId)}/prompt_async";
-            using var httpReq = new HttpRequestMessage(HttpMethod.Post, endpoint)
-            {
-                Content = new StringContent(jsonBody, Encoding.UTF8, "application/json"),
-            };
-            if (!string.IsNullOrWhiteSpace(options.AuthToken))
-            {
-                var creds = Convert.ToBase64String(Encoding.UTF8.GetBytes($"opencode:{options.AuthToken.Trim()}"));
-                httpReq.Headers.Authorization = new AuthenticationHeaderValue("Basic", creds);
-            }
-            using var resp = await SharedHttp.SendAsync(httpReq, token);
-            if (resp.IsSuccessStatusCode)
-                return new DispatchResult(true, $"posted {request.Events.Count} event(s) to opencode session {request.SessionId} ({(int)resp.StatusCode})");
-            var body = await resp.Content.ReadAsStringAsync(token);
-            return new DispatchResult(false, $"opencode POST {endpoint} returned {(int)resp.StatusCode}: {Clip(body, 240)}");
+            Content = new StringContent(jsonBody, Encoding.UTF8, "application/json"),
+        };
+        if (!string.IsNullOrWhiteSpace(password))
+        {
+            var creds = Convert.ToBase64String(Encoding.UTF8.GetBytes($"opencode:{password}"));
+            httpReq.Headers.Authorization = new AuthenticationHeaderValue("Basic", creds);
         }
 
-        // Otherwise invoke `opencode api POST /session/<id>/prompt_async --data <json>`.
-        var exe = string.IsNullOrWhiteSpace(options.ExecutablePath) ? "opencode" : options.ExecutablePath.Trim();
-        var args = new List<string> { "api", "POST", $"/session/{request.SessionId}/prompt_async", "--data", jsonBody };
-        var (exitCode, stdout, stderr) = await RunSubprocessAsync(exe, args, TimeSpan.FromSeconds(30), token);
-        if (exitCode == 0)
-            return new DispatchResult(true, $"posted {request.Events.Count} event(s) via opencode api to session {request.SessionId}");
+        using var resp = await SharedHttp.SendAsync(httpReq, token);
+        if (resp.IsSuccessStatusCode)
+            return new DispatchResult(true, $"posted {request.Events.Count} event(s) to opencode session {request.SessionId} ({(int)resp.StatusCode})");
 
-        var detail = string.IsNullOrWhiteSpace(stderr) ? stdout : stderr;
-        return new DispatchResult(false, $"opencode api failed (exit {exitCode}): {Clip(detail, 240)}");
+        var body = await resp.Content.ReadAsStringAsync(token);
+        return new DispatchResult(false, $"opencode POST {endpoint} returned {(int)resp.StatusCode}: {Clip(body, 240)}");
     }
 
     public static string ResolveKimiWebBaseUrl(Options options)
@@ -410,10 +549,7 @@ public static partial class ClientBridge
                 }
             }
         }
-        catch
-        {
-            // Fall through to default loopback URL.
-        }
+        catch { }
 
         return DefaultKimiWebUrl;
     }
@@ -436,80 +572,37 @@ public static partial class ClientBridge
                 if (text.Length > 0) return text;
             }
         }
-        catch
-        {
-            // Ignore unreadable token file.
-        }
+        catch { }
         return null;
     }
 
-    internal static async Task<string?> DiscoverLatestKimiWebSessionAsync(Options options, CancellationToken token)
+    public static string? ResolveOpenCodeServicePassword(Options options)
     {
-        var baseUrl = ResolveKimiWebBaseUrl(options);
-        var bearer = ResolveKimiWebToken(options);
-        var endpoint = $"{baseUrl.TrimEnd('/')}/api/v1/sessions";
+        if (!string.IsNullOrWhiteSpace(options.AuthToken))
+            return options.AuthToken.Trim();
 
+        var envPass = Environment.GetEnvironmentVariable("OPENCODE_SERVER_PASSWORD");
+        if (!string.IsNullOrWhiteSpace(envPass))
+            return envPass.Trim();
+
+        var ocDir = string.IsNullOrWhiteSpace(options.OpenCodeConfigDir)
+            ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".config", "opencode")
+            : options.OpenCodeConfigDir!;
+        var serviceFile = Path.Combine(ocDir, "service.json");
         try
         {
-            using var req = new HttpRequestMessage(HttpMethod.Get, endpoint);
-            if (!string.IsNullOrWhiteSpace(bearer))
-                req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", bearer);
-            using var resp = await SharedHttp.SendAsync(req, token);
-            if (!resp.IsSuccessStatusCode) return null;
-
-            var json = await resp.Content.ReadAsStringAsync(token);
-            using var doc = JsonDocument.Parse(json);
-            var root = doc.RootElement;
-            JsonElement list = root;
-            if (root.ValueKind == JsonValueKind.Object)
+            if (File.Exists(serviceFile))
             {
-                if (root.TryGetProperty("sessions", out var s)) list = s;
-                else if (root.TryGetProperty("items", out var items)) list = items;
-                else if (root.TryGetProperty("data", out var data)) list = data;
-            }
-            if (list.ValueKind != JsonValueKind.Array) return null;
-
-            foreach (var item in list.EnumerateArray())
-            {
-                if (item.ValueKind != JsonValueKind.Object) continue;
-                foreach (var key in new[] { "session_id", "sessionId", "id" })
+                using var doc = JsonDocument.Parse(File.ReadAllText(serviceFile, Encoding.UTF8));
+                if (doc.RootElement.TryGetProperty("password", out var prop) && prop.ValueKind == JsonValueKind.String)
                 {
-                    if (item.TryGetProperty(key, out var prop) && prop.ValueKind == JsonValueKind.String)
-                    {
-                        var val = prop.GetString();
-                        if (!string.IsNullOrWhiteSpace(val)) return val.Trim();
-                    }
+                    var pw = prop.GetString()?.Trim();
+                    if (!string.IsNullOrEmpty(pw)) return pw;
                 }
             }
         }
-        catch
-        {
-            // Kimi web server may not be running right now.
-        }
+        catch { }
         return null;
-    }
-
-    internal static string? DiscoverLatestCodexSessionId(string? codexHomeDir)
-    {
-        var home = string.IsNullOrWhiteSpace(codexHomeDir)
-            ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex")
-            : codexHomeDir!;
-        var sessionsDir = Path.Combine(home, "sessions");
-        try
-        {
-            if (!Directory.Exists(sessionsDir)) return null;
-            var newest = new DirectoryInfo(sessionsDir)
-                .EnumerateFiles("*.jsonl", SearchOption.AllDirectories)
-                .OrderByDescending(f => f.LastWriteTimeUtc)
-                .FirstOrDefault();
-            if (newest is null) return null;
-            var match = UuidRegex().Match(newest.Name);
-            return match.Success ? match.Value : null;
-        }
-        catch
-        {
-            return null;
-        }
     }
 
     private static string ResolveKimiHome(string? overrideDir) =>
@@ -557,8 +650,10 @@ public static partial class ClientBridge
     private static List<BoardEvent> FilterByWakeCap(
         List<BoardEvent> events,
         Dictionary<long, Queue<DateTime>> history,
+        Dictionary<long, DateTime> latchedUntil,
         int maxWakes,
         TimeSpan window,
+        TimeSpan cooldown,
         TextWriter err,
         string client)
     {
@@ -566,36 +661,83 @@ public static partial class ClientBridge
         var now = DateTime.UtcNow;
         var cutoff = now - window;
         var allowed = new List<BoardEvent>(events.Count);
-        var countedThreads = new HashSet<long>();
+        var checkedThreads = new Dictionary<long, bool>();
+
         foreach (var ev in events)
         {
-            if (!history.TryGetValue(ev.ThreadId, out var q))
+            if (checkedThreads.TryGetValue(ev.ThreadId, out var ok))
             {
-                q = new Queue<DateTime>();
-                history[ev.ThreadId] = q;
+                if (ok) allowed.Add(ev);
+                continue;
             }
-            while (q.Count > 0 && q.Peek() < cutoff) q.Dequeue();
 
-            if (!countedThreads.Contains(ev.ThreadId))
+            if (latchedUntil.TryGetValue(ev.ThreadId, out var until))
             {
-                if (q.Count >= maxWakes)
+                if (now < until)
                 {
+                    var remMin = Math.Max(1, (int)Math.Ceiling((until - now).TotalMinutes));
                     err.WriteLine(
-                        $"bridge [{client}]: wake cap ({maxWakes}/{window.TotalMinutes:0.#}m) reached for thread #{ev.ThreadId}; leaving msg #{ev.MsgId} in pending queries.");
+                        $"bridge [{client}]: wake cap cooldown active ({remMin}m left) for thread #{ev.ThreadId}; leaving msg #{ev.MsgId} in pending queries.");
                     err.Flush();
+                    checkedThreads[ev.ThreadId] = false;
                     continue;
                 }
-                q.Enqueue(now);
-                countedThreads.Add(ev.ThreadId);
+                latchedUntil.Remove(ev.ThreadId);
             }
+
+            if (history.TryGetValue(ev.ThreadId, out var q))
+            {
+                while (q.Count > 0 && q.Peek() < cutoff) q.Dequeue();
+                if (q.Count >= maxWakes)
+                {
+                    latchedUntil[ev.ThreadId] = now + cooldown;
+                    q.Clear();
+                    err.WriteLine(
+                        $"bridge [{client}]: wake cap ({maxWakes}/{window.TotalMinutes:0.#}m) tripped for thread #{ev.ThreadId}; latched for {cooldown.TotalMinutes:0}m, leaving msg #{ev.MsgId} in pending queries.");
+                    err.Flush();
+                    checkedThreads[ev.ThreadId] = false;
+                    continue;
+                }
+            }
+
+            checkedThreads[ev.ThreadId] = true;
             allowed.Add(ev);
         }
         return allowed;
     }
 
+    private static void RecordSuccessfulWake(
+        List<BoardEvent> delivered,
+        Dictionary<long, Queue<DateTime>> history,
+        Dictionary<long, DateTime> latchedUntil,
+        int maxWakes,
+        TimeSpan window,
+        TimeSpan cooldown)
+    {
+        if (maxWakes <= 0) return;
+        var now = DateTime.UtcNow;
+        var cutoff = now - window;
+        foreach (var tid in delivered.Select(e => e.ThreadId).Distinct())
+        {
+            if (!history.TryGetValue(tid, out var q))
+            {
+                q = new Queue<DateTime>();
+                history[tid] = q;
+            }
+            while (q.Count > 0 && q.Peek() < cutoff) q.Dequeue();
+            q.Enqueue(now);
+            if (q.Count >= maxWakes)
+            {
+                // Latch immediately once the Nth wake lands so the (N+1)th hits cooldown cleanly.
+                latchedUntil[tid] = now + cooldown;
+                q.Clear();
+            }
+        }
+    }
+
     private static string Clip(string text, int max)
     {
         var cleaned = (text ?? "").Replace('\r', ' ').Replace('\n', ' ').Trim();
-        return cleaned.Length <= max ? cleaned : cleaned[..max] + "…";
+        return cleaned.Length <= max ? cleaned : HookCheck.SafeSubstring(cleaned, max) + "…";
     }
 }

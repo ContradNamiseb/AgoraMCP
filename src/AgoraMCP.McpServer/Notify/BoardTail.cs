@@ -188,7 +188,7 @@ public static partial class BoardTail
         }
     }
 
-    private static bool TryAttachParentWatcher(
+    internal static bool TryAttachParentWatcher(
         int parentPid, CancellationTokenSource cts, out Process? parent)
     {
         parent = null;
@@ -250,13 +250,13 @@ public static partial class BoardTail
         }
     }
 
-    private static bool SafeHasExited(Process proc)
+    internal static bool SafeHasExited(Process proc)
     {
         try { return proc.HasExited; }
         catch { return false; }
     }
 
-    private static async Task WatchStdinEofAsync(CancellationTokenSource cts)
+    internal static async Task WatchStdinEofAsync(CancellationTokenSource cts)
     {
         try
         {

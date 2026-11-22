@@ -155,8 +155,10 @@ internal static class Program
     {
         var agent = Option(args, "--agent") ?? Environment.GetEnvironmentVariable("AGORA_AGENT") ?? "";
         var db = Option(args, "--db");
-        if (!TryParseOptionalLong(args, "--since", "hook-check", out var since)) return 2;
-        if (!TryParseOptionalInt(args, "--max-blocks", "hook-check", out var maxBlocks)) return 2;
+        // Fail-silent even on bad flags (L15): exit code 2 means "block stop" in
+        // Claude, Codex, and Kimi Stop hooks, so a config typo must never exit 2.
+        if (!TryParseOptionalLong(args, "--since", "hook-check", out var since)) return 0;
+        if (!TryParseOptionalInt(args, "--max-blocks", "hook-check", out var maxBlocks)) return 0;
 
         return Notify.HookCheck.Run(new Notify.HookCheck.Options
         {
@@ -185,6 +187,8 @@ internal static class Program
         if (!TryParseOptionalDouble(args, "--timeout", "bridge", out var timeout)) return 2;
         if (!TryParseOptionalDouble(args, "--interval", "bridge", out var interval)) return 2;
         if (!TryParseOptionalInt(args, "--max-wakes", "bridge", out var maxWakes)) return 2;
+        if (!TryParseOptionalInt(args, "--parent-pid", "bridge", out var parentPid)) return 2;
+        if (!TryParseOptionalNonNegativeDouble(args, "--session-max-age-sec", "bridge", out var sessionMaxAge)) return 2;
 
         var cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
@@ -195,6 +199,7 @@ internal static class Program
             Agent = agent,
             SessionId = Option(args, "--session"),
             SessionFilePath = Option(args, "--session-file"),
+            SessionMaxAgeSeconds = sessionMaxAge ?? Notify.ClientBridge.DefaultSessionMaxAgeSeconds,
             ServerUrl = Option(args, "--url"),
             AuthToken = Option(args, "--token"),
             ExecutablePath = Option(args, "--exe"),
@@ -207,6 +212,9 @@ internal static class Program
             TimeoutSeconds = timeout,
             IntervalSeconds = interval ?? (NamedBoardEvent.IsSupported ? 5 : 1),
             MaxWakesPerThread = maxWakes ?? 6,
+            ParentPid = parentPid,
+            ExitWithParent = args.Contains("--exit-with-parent"),
+            ExitOnStdinEof = args.Contains("--exit-on-stdin-eof"),
         }, log: null, token: cts.Token).GetAwaiter().GetResult();
     }
 
@@ -250,6 +258,21 @@ internal static class Program
             return true;
         }
         Console.Error.WriteLine($"{cmd}: invalid {flag} '{raw}' (expected positive number, e.g. 0.5 or 5).");
+        return false;
+    }
+
+    private static bool TryParseOptionalNonNegativeDouble(string[] args, string flag, string cmd, out double? value)
+    {
+        value = null;
+        var raw = Option(args, flag);
+        if (raw is null) return true;
+        if (double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed)
+            && !double.IsNaN(parsed) && !double.IsInfinity(parsed) && parsed >= 0)
+        {
+            value = parsed;
+            return true;
+        }
+        Console.Error.WriteLine($"{cmd}: invalid {flag} '{raw}' (expected non-negative number, e.g. 0 or 14400).");
         return false;
     }
 

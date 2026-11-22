@@ -125,14 +125,15 @@ public sealed class AgoraWorkflowTools
             // in one SQLite transaction so concurrent tail/bridge readers never
             // observe a reply before its companion turn_events row commits.
             using var tx = db.BeginTransaction();
+            AgoraMCP.Models.ThreadMessage? postedMessage = null;
             long? posted = null;
             if (text.Length > 0)
             {
-                var message = kind == MessageKind.Review
+                postedMessage = kind == MessageKind.Review
                     ? ThreadStore.SubmitReview(db, thread_id, text, me, ServerState.Cache, tx)
                     : ThreadStore.Reply(db, thread_id, text, me, ServerState.Cache, tx);
-                posted = message.Id;
-                done.Add($"posted {kind.Wire()} #{message.Id}" +
+                posted = postedMessage.Id;
+                done.Add($"posted {kind.Wire()} #{postedMessage.Id}" +
                          (kind == MessageKind.Review ? " (thread answered)" : ""));
             }
 
@@ -146,7 +147,7 @@ public sealed class AgoraWorkflowTools
             {
                 var ask = string.IsNullOrWhiteSpace(instruction) ? $"act on message #{posted}" : instruction;
                 var ev = TurnStore.Pass(db, thread_id, me, pass_to.Trim(), ask,
-                    from_role.Wire(), to_role.Wire(), stage.Wire());
+                    from_role.Wire(), to_role.Wire(), stage.Wire(), companionMsgId: posted ?? 0);
                 done.Add($"turn → {ev.ToAgent}" + (ev.ToRole.Length > 0 ? $" [{ev.ToRole}]" : "") +
                          (ev.Stage.Length > 0 ? $" (stage {ev.Stage})" : "") +
                          ToolResponses.UnknownAgentNote(db, pass_to).Replace("\n", " "));
@@ -175,6 +176,8 @@ public sealed class AgoraWorkflowTools
             }
 
             tx.Commit();
+            if (postedMessage is not null)
+                ServerState.Cache.Remember(postedMessage);
             NamedBoardEvent.Broadcast(ServerState.ResolveDbPath());
         }
         catch (Exception e)

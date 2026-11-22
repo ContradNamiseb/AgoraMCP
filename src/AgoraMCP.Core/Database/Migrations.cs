@@ -61,6 +61,10 @@ public static class Migrations
                 db.Execute("ALTER TABLE turn_events ADD COLUMN to_role TEXT NOT NULL DEFAULT ''");
             if (!existingCols.Contains("stage"))
                 db.Execute("ALTER TABLE turn_events ADD COLUMN stage TEXT NOT NULL DEFAULT ''");
+            if (!existingCols.Contains("at_msg_id"))
+                db.Execute("ALTER TABLE turn_events ADD COLUMN at_msg_id INTEGER NOT NULL DEFAULT 0");
+            if (!existingCols.Contains("msg_id"))
+                db.Execute("ALTER TABLE turn_events ADD COLUMN msg_id INTEGER NOT NULL DEFAULT 0");
         }
     }
 }

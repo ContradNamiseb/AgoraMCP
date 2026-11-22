@@ -82,7 +82,8 @@ public static class TurnStore
         string instruction,
         string fromRole = "",
         string toRole = "",
-        string stage = "")
+        string stage = "",
+        long companionMsgId = 0)
     {
         if (threadId <= 0)
             throw new AgoraException($"turn: thread id {threadId} is not a thread.");
@@ -98,10 +99,13 @@ public static class TurnStore
             throw new AgoraException(
                 "turn: instruction is required — a turn without a stated action is the deadlock this protocol exists to prevent.");
 
+        var atMsgId = db.Scalar<long>("SELECT COALESCE(MAX(id), 0) FROM messages");
+        if (companionMsgId > atMsgId) atMsgId = companionMsgId;
+
         using var cmd = db.Prepare("""
-            INSERT INTO turn_events(thread_id, from_agent, to_agent, from_role, to_role, stage, instruction)
-            VALUES ($t, $f, $to, $fr, $tr, $s, $i)
-            """, "$t", "$f", "$to", "$fr", "$tr", "$s", "$i");
+            INSERT INTO turn_events(thread_id, from_agent, to_agent, from_role, to_role, stage, instruction, at_msg_id, msg_id)
+            VALUES ($t, $f, $to, $fr, $tr, $s, $i, $at_msg, $msg_id)
+            """, "$t", "$f", "$to", "$fr", "$tr", "$s", "$i", "$at_msg", "$msg_id");
         cmd.SetAll(
             threadId,
             fromAgent.Trim(),
@@ -109,7 +113,9 @@ public static class TurnStore
             fromRole.Trim(),
             toRole.Trim(),
             stage.Trim(),
-            instruction.Trim());
+            instruction.Trim(),
+            atMsgId,
+            companionMsgId);
         cmd.ExecuteNonQuery();
         return ForThread(db, threadId).Last(e => e.ToAgent == toAgent.Trim());
     }

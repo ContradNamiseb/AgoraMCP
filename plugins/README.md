@@ -3,10 +3,12 @@
 Zero-polling, hub-less direct agent notifications built on `agora tail`, `agora bridge`, and `agora hook-check` (Windows `NamedBoardEvent` kernel wake, 0% CPU and 0 idle tokens).
 
 All adapters share the same security and reliability guarantees:
-- **Cursor continuity across restarts** (`--since` / `--since-turn` track both `messages` and `turn_events`).
-- **Parent-exit cleanup** (`--exit-with-parent` / `--parent-pid` / `--exit-on-stdin-eof` prevent orphaned `agora tail` processes).
-- **Untrusted peer-data boundary** (`<<<AGORA_PEER_MESSAGE>>>` framing with header neutralization and sanitized author identifiers).
-- **Per-thread auto-wake cap** (default 6 wakes per thread per 10 minutes, configurable via `AGORA_MAX_WAKES_PER_THREAD` or `--max-wakes`; capped messages stay in pending queries and still trigger toasts/logs).
+- **Cursor continuity across restarts** (`--since` / `--since-turn` track both `messages` and `turn_events` with as-of-message routing).
+- **Parent-exit cleanup** (`--exit-with-parent` / `--parent-pid` / `--exit-on-stdin-eof` prevent orphaned `agora tail` / `agora bridge` processes, since .NET on Windows discards broken stdout pipe writes).
+- **Untrusted peer-data boundary** (per-message random nonce `<<<AGORA_PEER_MESSAGE:<hex>>>>` framing with mid-line marker neutralization, sanitized author identifiers, and batch caps of 5 events / 8,000 chars).
+- **Latching per-thread loop breaker** (default 6 wakes per 10 minutes trips a 60-minute latch cooldown, reset by a human prompt or `/agora-notify on`; capped messages stay in pending queries and still trigger toasts/logs).
+- **No batch-wrapper execution** (`agora bridge` refuses `.cmd`/`.bat` shims on Windows so untrusted peer text never touches `cmd.exe`, and defaults OpenCode bridge delivery to local HTTP).
+- **No blind session guessing** (`bridge.mjs` and `agora bridge` require `--session` or a fresh active-session beacon within 4 hours; otherwise mail stays safely in pending queries).
 
 ---
 
@@ -79,26 +81,26 @@ A hub-less OpenCode v2 plugin (no `agora hub` daemon required) that spawns `agor
 
 ## 4. Codex (`0.153+`) — Hooks + `agora bridge --client codex`
 
-1. Install `plugins/hooks/codex-hooks.json` into `~/.codex/hooks.json` (replace `agora` with your full `publish/agora.exe` path if not on `PATH`).
-   - Immediately catches mail arriving before/during/at the end of every Codex turn (`SessionStart`, `UserPromptSubmit`, `PostToolUse`, `Stop` block with loop guard).
-   - Automatically records the active Codex thread UUID into `%LOCALAPPDATA%\AgoraMCP\sessions\codex.json` via `--record-session`.
+1. Install `plugins/hooks/codex-hooks.json` into `~/.codex/hooks.json` (replace `agora` with your full `publish/agora.exe` path if `publish/` is not on `PATH`).
+   - Catches mail arriving before/during/at the end of every Codex turn (`SessionStart`, `UserPromptSubmit`, `PostToolUse`, `Stop` block with latched loop guard; remove `PostToolUse` if you want to skip ~200 ms per-tool Windows spawn latency).
+   - Uses per-session cursors keyed by `session_id` with an exclusive lock file, and records the active Codex thread UUID into `%LOCALAPPDATA%\AgoraMCP\sessions\codex.json` via `--record-session`.
 2. For idle session wake via Codex's shared daemon, run:
    ```bash
    agora bridge --client codex
    ```
-   It sleeps at 0% CPU on `NamedBoardEvent` and invokes `codex queue --thread <uuid> --message <mail>` whenever peer mail lands (falls back to the newest `~/.codex/sessions/*.jsonl` rollout UUID if no beacon was written yet, or pass `--session <UUID>`).
+   It sleeps at 0% CPU on `NamedBoardEvent` and invokes native `codex.exe queue --thread <uuid> --message <mail>` whenever peer mail lands (requires `--session <UUID>` or a fresh beacon within `--session-max-age-sec`, default 4 hours; refuses `.cmd`/`.bat` shims).
 
 ---
 
 ## 5. Kimi Code (`2.2+`) — Hooks + `agora bridge --client kimi-web`
 
-1. Append `plugins/hooks/kimi-hooks.toml` to `~/.kimi-code/config.toml` (validate with `kimi doctor`).
+1. Append `plugins/hooks/kimi-hooks.toml` to `~/.kimi-code/config.toml` (replace `agora` with your full `publish/agora.exe` path if not on `PATH`, then validate with `kimi doctor`).
    - Catches mail on `UserPromptSubmit`, blocks turn exit with exit code `2` on `Stop` if peer mail arrived mid-turn, and records the active session ID.
 2. For idle session wake when using `kimi web`, run:
    ```bash
-   agora bridge --client kimi-web
+   agora bridge --client kimi-web --session <session-id>
    ```
-   It auto-discovers the running `kimi web` URL (`~/.kimi-code/server/instances/*.json` or `http://127.0.0.1:58627`), reads `~/.kimi-code/server.token`, resolves the active session from the beacon or `GET /api/v1/sessions`, and posts to `POST /api/v1/sessions/{id}/prompts`.
+   (or let the `--record-session` hook populate a fresh beacon). It auto-discovers the running `kimi web` URL (`~/.kimi-code/server/instances/*.json` or `http://127.0.0.1:58627`), reads `~/.kimi-code/server.token`, and posts to `POST /api/v1/sessions/{id}/prompts`.
 
 ---
 

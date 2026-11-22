@@ -281,17 +281,26 @@ public static class NotifyHub
     }
 
     /// <summary>
-    /// Computes the true recipient of a message:
+    /// Computes the true recipient of a message AS OF the turn state active when
+    /// that message was posted:
     /// - On DM threads (one shared thread per pair, where threads.directed_to
     ///   stays frozen as the initial recipient), the recipient is whichever party
     ///   (created_by or directed_to) is NOT the message author.
-    /// - On board threads, an explicit turn pass to another agent wins (even on
-    ///   a directed thread handed off to a third reviewer).
+    /// - On board threads with an active turn pass as of the message:
+    ///   - if someone other than the holder posted (or a companion pass hands off
+    ///     to turnHolder), route to turnHolder;
+    ///   - if the turn holder itself replies without passing the turn away, route
+    ///     back to whoever passed them the turn (turnFromAgent), else created_by.
     /// - Otherwise, on directed board threads: the asker's posts go to
     ///   directed_to, and directed_to's replies route back to created_by.
     /// </summary>
     internal static string EffectiveRecipient(
-        string threadKind, string createdBy, string directedTo, string turnHolder, string author)
+        string threadKind,
+        string createdBy,
+        string directedTo,
+        string turnHolder,
+        string turnFromAgent,
+        string author)
     {
         if (string.Equals(threadKind, DmStore.ThreadKind, StringComparison.OrdinalIgnoreCase))
         {
@@ -299,8 +308,13 @@ public static class NotifyHub
             if (AgentIdentity.AnswersTo(directedTo, author)) return createdBy;
             return directedTo;
         }
-        if (turnHolder.Length > 0 && !AgentIdentity.AnswersTo(turnHolder, author))
-            return turnHolder;
+        if (turnHolder.Length > 0)
+        {
+            if (!AgentIdentity.AnswersTo(turnHolder, author)) return turnHolder;
+            if (turnFromAgent.Length > 0 && !AgentIdentity.AnswersTo(turnFromAgent, author)) return turnFromAgent;
+            if (createdBy.Length > 0 && !AgentIdentity.AnswersTo(createdBy, author)) return createdBy;
+            return "";
+        }
         if (directedTo.Length > 0)
         {
             if (AgentIdentity.AnswersTo(directedTo, author)) return createdBy;
@@ -309,16 +323,68 @@ public static class NotifyHub
         return "";
     }
 
-    internal static (List<BoardEvent> Events, long MaxTurnSeq) ReadTurnEventsSince(
+    internal static (List<BoardEvent> Events, long MaxMsgSeq, long MaxTurnSeq) ReadCombinedSince(
         string dbPath,
+        long sinceMsgId,
         long sinceTurnId,
         string agent,
-        bool excludeSelf = true)
+        bool directedOnly = false,
+        bool dmsOnly = false,
+        bool excludeSelf = false)
+    {
+        // Single WAL read snapshot across both messages and turn_events so a
+        // concurrent respond() commit can never split between the two queries.
+        using var db = AgoraDatabase.Open(dbPath);
+        using var tx = db.BeginTransaction();
+
+        var (msgEvents, maxMsg) = ReadEventsSinceCore(
+            db, sinceMsgId, agent, directedOnly, dmsOnly, excludeSelf);
+
+        if (dmsOnly)
+            return (msgEvents, maxMsg, sinceTurnId);
+
+        var (turnEvents, maxTurn) = ReadTurnEventsSinceCore(
+            db, sinceTurnId, agent, excludeSelf);
+
+        if (turnEvents.Count == 0)
+            return (msgEvents, maxMsg, maxTurn);
+
+        // Deduplicate ONLY a companion pass whose exact msg_id was already
+        // emitted in this batch (with its instruction attached to that message).
+        // Standalone turn passes (msg_id == 0) are never suppressed by earlier
+        // unrelated messages on the same thread.
+        var emittedMsgIds = msgEvents.Where(m => m.MsgId > 0).Select(m => m.MsgId).ToHashSet();
+        foreach (var (ev, companionMsgId) in turnEvents)
+        {
+            if (companionMsgId > 0 && emittedMsgIds.Contains(companionMsgId))
+                continue;
+            msgEvents.Add(ev with { Seq = maxMsg });
+        }
+
+        return (msgEvents, maxMsg, maxTurn);
+    }
+
+    internal static (List<BoardEvent> Events, long MaxSeq) ReadEventsSince(
+        string dbPath,
+        long since,
+        string agent,
+        bool directedOnly = false,
+        bool dmsOnly = false,
+        bool excludeSelf = false)
     {
         using var db = AgoraDatabase.Open(dbPath);
+        return ReadEventsSinceCore(db, since, agent, directedOnly, dmsOnly, excludeSelf);
+    }
+
+    private static (List<(BoardEvent Event, long CompanionMsgId)> Events, long MaxTurnSeq) ReadTurnEventsSinceCore(
+        Microsoft.Data.Sqlite.SqliteConnection db,
+        long sinceTurnId,
+        string agent,
+        bool excludeSelf)
+    {
         var rows = db.Prepare("""
             SELECT te.id, te.thread_id, te.from_agent, te.to_agent,
-                   te.from_role, te.to_role, te.stage, te.instruction, te.created_at,
+                   te.from_role, te.to_role, te.stage, te.instruction, te.msg_id, te.created_at,
                    t.topic
             FROM turn_events te
             JOIN threads t ON t.id = te.thread_id
@@ -336,11 +402,12 @@ public static class NotifyHub
                 ToRole: r.GetString("to_role"),
                 Stage: r.GetString("stage"),
                 Instruction: r.GetString("instruction"),
+                CompanionMsgId: r.GetInt64("msg_id"),
                 At: r.GetString("created_at"),
                 Topic: r.GetString("topic")));
 
         var maxTurn = sinceTurnId;
-        var events = new List<BoardEvent>();
+        var events = new List<(BoardEvent, long)>();
         var target = agent.Trim();
         foreach (var r in rows)
         {
@@ -351,13 +418,8 @@ public static class NotifyHub
                 if (!AgentIdentity.AnswersTo(target, r.ToAgent)) continue;
             }
 
-            var meta = new List<string>();
-            if (r.ToRole.Length > 0) meta.Add($"role={r.ToRole}");
-            if (r.Stage.Length > 0) meta.Add($"stage={r.Stage}");
-            var prefix = meta.Count > 0 ? $"[turn passed ({string.Join(", ", meta)})] " : "[turn passed] ";
-            var body = prefix + r.Instruction;
-
-            events.Add(new BoardEvent(
+            var body = FormatTurnPassNote(r.ToRole, r.Stage, r.Instruction);
+            events.Add((new BoardEvent(
                 Seq: 0,
                 Kind: "turn_pass",
                 ThreadId: r.ThreadId,
@@ -367,66 +429,35 @@ public static class NotifyHub
                 DirectedTo: r.ToAgent,
                 CreatedAt: r.At,
                 Body: body,
-                TurnSeq: r.Id));
+                TurnSeq: r.Id), r.CompanionMsgId));
         }
         return (events, maxTurn);
     }
 
-    /// <summary>
-    /// Reads both new <c>messages</c> and (when not <paramref name="dmsOnly"/>)
-    /// new <c>turn_events</c> since their respective cursors. Deduplicates a
-    /// turn pass that landed in the same batch as a message already emitted for
-    /// the same (thread, author, recipient) so <c>respond(body + pass_to)</c>
-    /// never double-wakes, while body-less turn passes and delayed turn passes
-    /// always emit a live <c>turn_pass</c> event.
-    /// </summary>
-    internal static (List<BoardEvent> Events, long MaxMsgSeq, long MaxTurnSeq) ReadCombinedSince(
-        string dbPath,
-        long sinceMsgId,
-        long sinceTurnId,
-        string agent,
-        bool directedOnly = false,
-        bool dmsOnly = false,
-        bool excludeSelf = false)
-    {
-        var (msgEvents, maxMsg) = ReadEventsSince(
-            dbPath, sinceMsgId, agent, directedOnly, dmsOnly, excludeSelf);
-
-        if (dmsOnly)
-            return (msgEvents, maxMsg, sinceTurnId);
-
-        var (turnEvents, maxTurn) = ReadTurnEventsSince(
-            dbPath, sinceTurnId, agent, excludeSelf);
-
-        if (turnEvents.Count == 0)
-            return (msgEvents, maxMsg, maxTurn);
-
-        foreach (var te in turnEvents)
-        {
-            var coveredByMessage = msgEvents.Any(m =>
-                m.ThreadId == te.ThreadId &&
-                AgentIdentity.AnswersTo(m.Author, te.Author) &&
-                AgentIdentity.AnswersTo(m.DirectedTo, te.DirectedTo));
-            if (!coveredByMessage)
-                msgEvents.Add(te with { Seq = maxMsg });
-        }
-
-        return (msgEvents, maxMsg, maxTurn);
-    }
-
-    internal static (List<BoardEvent> Events, long MaxSeq) ReadEventsSince(
-        string dbPath,
+    private static (List<BoardEvent> Events, long MaxSeq) ReadEventsSinceCore(
+        Microsoft.Data.Sqlite.SqliteConnection db,
         long since,
         string agent,
-        bool directedOnly = false,
-        bool dmsOnly = false,
-        bool excludeSelf = false)
+        bool directedOnly,
+        bool dmsOnly,
+        bool excludeSelf)
     {
-        using var db = AgoraDatabase.Open(dbPath);
+        // Resolve the turn pass active AS OF each message m (not the newest turn
+        // pass on the thread at read time) so late reads, hook batches, and
+        // --since replays route identically to live delivery.
         var rows = db.Prepare("""
             SELECT m.id, m.thread_id, m.author, m.kind, m.body,
                    t.topic, t.created_by, t.directed_to, t.kind AS thread_kind,
-                   COALESCE((SELECT te.to_agent FROM turn_events te WHERE te.thread_id = t.id ORDER BY te.id DESC LIMIT 1), '') AS turn_holder,
+                   COALESCE((
+                       SELECT te.id FROM turn_events te
+                       WHERE te.thread_id = t.id
+                         AND (
+                           te.msg_id = m.id
+                           OR (te.at_msg_id > 0 AND te.at_msg_id < m.id)
+                           OR (te.at_msg_id = 0 AND te.created_at <= m.created_at)
+                         )
+                       ORDER BY te.id DESC LIMIT 1
+                   ), 0) AS asof_turn_id,
                    m.created_at
             FROM messages m
             JOIN threads t ON t.id = m.thread_id
@@ -445,8 +476,29 @@ public static class NotifyHub
                 CreatedBy: r.GetString("created_by"),
                 DirectedTo: r.GetString("directed_to"),
                 ThreadKind: r.GetString("thread_kind"),
-                TurnHolder: r.GetString("turn_holder"),
+                AsOfTurnId: r.GetInt64("asof_turn_id"),
                 At: r.GetString("created_at")));
+
+        // Hydrate only the referenced turn_events rows in one tiny map.
+        var turnLookup = new Dictionary<long, (string ToAgent, string FromAgent, string ToRole, string Stage, string Instruction, long CompanionMsgId)>();
+        foreach (var tid in rows.Select(r => r.AsOfTurnId).Where(id => id > 0).Distinct())
+        {
+            var found = db.Prepare("""
+                SELECT to_agent, from_agent, to_role, stage, instruction, msg_id
+                FROM turn_events WHERE id = $id
+                """, "$id")
+                .Set("$id", tid)
+                .Query(tr => (
+                    ToAgent: tr.GetString("to_agent"),
+                    FromAgent: tr.GetString("from_agent"),
+                    ToRole: tr.GetString("to_role"),
+                    Stage: tr.GetString("stage"),
+                    Instruction: tr.GetString("instruction"),
+                    CompanionMsgId: tr.GetInt64("msg_id")))
+                .FirstOrDefault();
+            if (found.ToAgent is not null)
+                turnLookup[tid] = found;
+        }
 
         var maxSeq = since;
         var events = new List<BoardEvent>();
@@ -457,7 +509,19 @@ public static class NotifyHub
             var isDm = string.Equals(r.ThreadKind, DmStore.ThreadKind, StringComparison.OrdinalIgnoreCase);
             if (dmsOnly && !isDm) continue;
 
-            var effectiveTo = EffectiveRecipient(r.ThreadKind, r.CreatedBy, r.DirectedTo, r.TurnHolder, r.Author);
+            var turnHolder = "";
+            var turnFrom = "";
+            string? companionInstruction = null;
+            if (r.AsOfTurnId > 0 && turnLookup.TryGetValue(r.AsOfTurnId, out var te))
+            {
+                turnHolder = te.ToAgent;
+                turnFrom = te.FromAgent;
+                if (te.CompanionMsgId == r.Seq && te.Instruction.Length > 0)
+                    companionInstruction = FormatTurnPassNote(te.ToRole, te.Stage, te.Instruction);
+            }
+
+            var effectiveTo = EffectiveRecipient(
+                r.ThreadKind, r.CreatedBy, r.DirectedTo, turnHolder, turnFrom, r.Author);
             if (target.Length > 0)
             {
                 if (excludeSelf && AgentIdentity.AnswersTo(target, r.Author)) continue;
@@ -472,9 +536,21 @@ public static class NotifyHub
             }
 
             var kind = isDm ? DmStore.MessageKind : r.Kind;
-            events.Add(new BoardEvent(r.Seq, kind, r.ThreadId, r.Seq, r.Author, r.Topic, effectiveTo, r.At, r.Body));
+            var body = companionInstruction is not null
+                ? $"{r.Body}\n\n{companionInstruction}"
+                : r.Body;
+            events.Add(new BoardEvent(r.Seq, kind, r.ThreadId, r.Seq, r.Author, r.Topic, effectiveTo, r.At, body));
         }
         return (events, maxSeq);
+    }
+
+    private static string FormatTurnPassNote(string toRole, string stage, string instruction)
+    {
+        var meta = new List<string>();
+        if (toRole.Length > 0) meta.Add($"role={toRole}");
+        if (stage.Length > 0) meta.Add($"stage={stage}");
+        var prefix = meta.Count > 0 ? $"[turn passed ({string.Join(", ", meta)})] " : "[turn passed] ";
+        return prefix + instruction;
     }
 
     internal static List<(string Line, long Seq, string To, string Author, string Topic)> ReadSince(

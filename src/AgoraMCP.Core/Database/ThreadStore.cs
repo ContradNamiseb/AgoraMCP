@@ -454,7 +454,11 @@ public static class ThreadStore
             Body = body,
             CreatedAt = createdAt,
         };
-        cache?.Remember(message);
+        // Only cache once committed: if running inside an outer transaction,
+        // the caller remembers the message after outerTx.Commit() so a rollback
+        // can never leave a phantom body cached under a reused INTEGER PRIMARY KEY.
+        if (outerTx is null)
+            cache?.Remember(message);
         return message;
     }
 

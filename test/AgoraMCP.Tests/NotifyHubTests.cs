@@ -98,10 +98,10 @@ public sealed class NotifyHubTests
             (dmThread, _) = DmStore.Send(db, "claudecode", "antigravity", "ping from claude");
             // antigravity replies on the same thread (under a former alias too!).
             DmStore.Send(db, "gemini-antigravity", "claudecode", "pong from antigravity");
-            // Open board thread with a turn pass to claudecode.
+            // Open board thread with a companion reply + turn pass to claudecode.
             var boardThread = ThreadStore.PostQuestion(db, "open-work", "initial context", "codex");
-            ThreadStore.Reply(db, boardThread, "please check this PR", "codex");
-            TurnStore.Pass(db, boardThread, "codex", "claude-opus", "review the diff");
+            var prMsg = ThreadStore.Reply(db, boardThread, "please check this PR", "codex");
+            TurnStore.Pass(db, boardThread, "codex", "claude-opus", "review the diff", companionMsgId: prMsg.Id);
         }
 
         // For claudecode (directedOnly + excludeSelf):

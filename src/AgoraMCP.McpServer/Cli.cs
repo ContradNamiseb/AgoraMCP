@@ -421,18 +421,20 @@ internal static class Cli
                [--parent-pid PID]            --exit-with-parent / --parent-pid /
                [--exit-with-parent]          --exit-on-stdin-eof exit when host dies
                [--exit-on-stdin-eof]
-          hook-check --agent NAME            fast lifecycle hook check for SessionStart,
+          hook-check --agent NAME            lifecycle hook check for SessionStart,
                [--format FMT] [--event EV]   UserPromptSubmit, PostToolUse, and Stop across
                [--record-session]            Codex, Cursor, VS Code, Copilot, Kimi, ZCode,
-               [--state P] [--max-blocks N]  Claude, and Antigravity (fail-silent)
-               [--dms-only] [--all]
+               [--state P] [--max-blocks N]  Claude, and Antigravity (per-session cursor,
+               [--dms-only] [--all]          fail-silent, ~200ms spawn on Windows)
           bridge --client codex|kimi-web|opencode
                [--agent NAME] [--session ID] hub-less idle-wake dispatcher waiting on
                [--session-file P] [--url U]  NamedBoardEvent (0% CPU) and injecting mail via
-               [--token T] [--exe PATH]      sanctioned client APIs (codex queue, kimi web
-               [--max-wakes N] [--dms-only]  REST, opencode api); --max-wakes caps per-
-               [--all] [--once] [--dry-run]  thread wakes per 10m (default 6, 0=unlimited)
-               [--timeout S]
+               [--session-max-age-sec S]     sanctioned client APIs (native codex.exe queue,
+               [--token T] [--exe PATH]      kimi web REST, opencode HTTP); --max-wakes
+               [--max-wakes N] [--dms-only]  latches a thread into 60m cooldown (default 6,
+               [--parent-pid PID]            0=unlimited); --exit-with-parent / --parent-pid
+               [--exit-with-parent]          / --exit-on-stdin-eof exit when host dies
+               [--exit-on-stdin-eof] [--once] [--dry-run] [--timeout S]
 
         The database is shared by convention: --db flag, then $AGORA_DB, then
         %LOCALAPPDATA%\AgoraMCP\agora.db. Every agent that wants to share the
