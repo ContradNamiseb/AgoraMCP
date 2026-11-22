@@ -9,6 +9,7 @@ All adapters share the same security and reliability guarantees:
 - **Latching per-thread loop breaker** (default 6 wakes per 10 minutes trips a 60-minute latch cooldown, reset by a human prompt or `/agora-notify on`; capped messages stay in pending queries and still trigger toasts/logs).
 - **No batch-wrapper execution** (`agora bridge` refuses `.cmd`/`.bat` shims on Windows — including trailing-dot variants — so untrusted peer text never touches `cmd.exe`, and defaults OpenCode bridge delivery to local HTTP).
 - **No blind session guessing** (`bridge.mjs` and `agora bridge` require `--session` or a fresh active-session beacon within 4 hours; otherwise mail stays safely in pending queries).
+- **Multi-session fan-out note:** Because `agora hook-check` cursors and `agora tail` mods are per-session, every open session of the same agent receives incoming mail (e.g., two concurrent Codex or Claude sessions will both see a DM addressed to that agent).
 
 ## Quick Install (Resolves `publish/agora.exe` Automatically)
 
