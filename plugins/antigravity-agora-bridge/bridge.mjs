@@ -1,5 +1,5 @@
 // Agora DM / directed-mail bridge sidecar for Antigravity App (2.0).
-// Runs `agora tail --agent antigravity --parent-pid <pid> --exit-on-stdin-eof`
+// Runs `agora tail --agent antigravity --parent-pid <pid> --exit-on-stdin-eof --emit-ready`
 // (0% CPU NamedBoardEvent wait) and delivers incoming peer messages into the
 // currently active top-level Antigravity conversation recorded by beacon.mjs.
 
@@ -19,16 +19,22 @@ const ACTIVE_FILE = join(DATA_DIR, 'active.json')
 
 const ACTIVE_MAX_AGE_MS = parseNonNegativeInt(process.env.AGORA_ACTIVE_MAX_AGE_MS, 4 * 60 * 60 * 1000)
 const MAX_WAKES_PER_THREAD = parseNonNegativeInt(process.env.AGORA_MAX_WAKES_PER_THREAD, 6)
+const MAX_GLOBAL_WAKES = parseNonNegativeInt(process.env.AGORA_MAX_GLOBAL_WAKES, 15)
 const MAX_BODY_CHARS = 3000
+const MAX_TOPIC_CHARS = 80
 const WAKE_WINDOW_MS = 10 * 60 * 1000
 const WAKE_COOLDOWN_MS = 60 * 60 * 1000
+const STABLE_UPTIME_MS = 10 * 1000
 
 const wakeHistory = new Map()
-// Map<threadKey, { until: number, activeUpdatedAt: string }>
 const latchedThreads = new Map()
+let globalWakeHistory = []
+let globalLatched = null
 let lastMsgSeq = 0
 let lastTurnSeq = 0
+let hasCursor = false
 let initialSinceConsumed = false
+let consecutiveUsageErrors = 0
 
 function parseNonNegativeInt(raw, fallback) {
   if (raw === undefined || raw === null || String(raw).trim() === '') return fallback
@@ -57,33 +63,51 @@ function sanitizeIdentifier(value, fallback) {
 
 function sanitizeInline(value, fallback) {
   const cleaned = String(value || '')
-    .replace(/[\r\n]+/g, ' ')
+    .replace(/\p{Cf}/gu, '')
+    .replace(/[\p{Cc}\p{Zl}\p{Zp}\s]+/gu, ' ')
     .replace(/"/g, "'")
     .trim()
-  return cleaned.length > 0 ? cleaned : fallback
+  if (cleaned.length === 0) return fallback
+  return cleaned.length <= MAX_TOPIC_CHARS ? cleaned : safeTruncate(cleaned, MAX_TOPIC_CHARS - 1) + '…'
 }
 
 function neutralizePeerBody(body) {
   const normalized = String(body || '')
     .replace(/\r\n/g, '\n')
-    .replace(/\r/g, '\n')
+    .replace(/\p{Cf}/gu, '')
+    .replace(/[\r\v\f\u0085\p{Zl}\p{Zp}]/gu, '\n')
     .replace(/<<<AGORA_PEER_MESSAGE/gi, '[agora-peer-marker-escaped]')
     .replace(/<<<END_AGORA_PEER_MESSAGE/gi, '[agora-peer-end-escaped]')
 
   return normalized
     .split('\n')
-    .map((line) => (/^\[Agora\s/i.test(line.trimStart()) ? '> ' + line : line))
+    .map((line) => (/^\[Agora[\s\t]/i.test(line.trimStart()) ? '> ' + line : line))
     .join('\n')
 }
 
 function allowWakeForThread(threadId, currentActiveUpdatedAt) {
+  const now = Date.now()
+  const cutoff = now - WAKE_WINDOW_MS
+
+  if (MAX_GLOBAL_WAKES > 0) {
+    if (globalLatched) {
+      const humanTurnHappened =
+        currentActiveUpdatedAt && globalLatched.activeUpdatedAt && currentActiveUpdatedAt !== globalLatched.activeUpdatedAt
+      if (now < globalLatched.until && !humanTurnHappened) return false
+      globalLatched = null
+    }
+    globalWakeHistory = globalWakeHistory.filter((ts) => ts >= cutoff)
+    if (globalWakeHistory.length >= MAX_GLOBAL_WAKES) {
+      globalLatched = { until: now + WAKE_COOLDOWN_MS, activeUpdatedAt: currentActiveUpdatedAt || '' }
+      globalWakeHistory = []
+      return false
+    }
+  }
+
   if (MAX_WAKES_PER_THREAD <= 0) return true
   const key = String(threadId ?? 0)
-  const now = Date.now()
-
   const latched = latchedThreads.get(key)
   if (latched) {
-    // A newer human turn (updatedAt advanced in active.json) or cooldown expiry clears the latch.
     const humanTurnHappened =
       currentActiveUpdatedAt && latched.activeUpdatedAt && currentActiveUpdatedAt !== latched.activeUpdatedAt
     if (now < latched.until && !humanTurnHappened) {
@@ -92,7 +116,6 @@ function allowWakeForThread(threadId, currentActiveUpdatedAt) {
     latchedThreads.delete(key)
   }
 
-  const cutoff = now - WAKE_WINDOW_MS
   const list = (wakeHistory.get(key) || []).filter((ts) => ts >= cutoff)
   if (list.length >= MAX_WAKES_PER_THREAD) {
     latchedThreads.set(key, { until: now + WAKE_COOLDOWN_MS, activeUpdatedAt: currentActiveUpdatedAt || '' })
@@ -103,10 +126,20 @@ function allowWakeForThread(threadId, currentActiveUpdatedAt) {
 }
 
 function recordSuccessfulWake(threadId, currentActiveUpdatedAt) {
-  if (MAX_WAKES_PER_THREAD <= 0) return
-  const key = String(threadId ?? 0)
   const now = Date.now()
   const cutoff = now - WAKE_WINDOW_MS
+
+  if (MAX_GLOBAL_WAKES > 0) {
+    globalWakeHistory = globalWakeHistory.filter((ts) => ts >= cutoff)
+    globalWakeHistory.push(now)
+    if (globalWakeHistory.length >= MAX_GLOBAL_WAKES) {
+      globalLatched = { until: now + WAKE_COOLDOWN_MS, activeUpdatedAt: currentActiveUpdatedAt || '' }
+      globalWakeHistory = []
+    }
+  }
+
+  if (MAX_WAKES_PER_THREAD <= 0) return
+  const key = String(threadId ?? 0)
   const list = (wakeHistory.get(key) || []).filter((ts) => ts >= cutoff)
   list.push(now)
   if (list.length >= MAX_WAKES_PER_THREAD) {
@@ -124,13 +157,16 @@ function resolveTargetConversation() {
   try {
     const data = JSON.parse(readFileSync(ACTIVE_FILE, 'utf-8'))
     const id = typeof data?.conversationId === 'string' ? data.conversationId.trim() : ''
-    const updatedAt = typeof data?.updatedAt === 'string' ? data.updatedAt : ''
-    if (!id) {
-      return { id: null, updatedAt: '', reason: 'active.json has no conversationId' }
+    const updatedAt = typeof data?.updatedAt === 'string' ? data.updatedAt.trim() : ''
+    if (!id || id.startsWith('-')) {
+      return { id: null, updatedAt: '', reason: 'active.json has no valid conversationId' }
     }
-    if (ACTIVE_MAX_AGE_MS > 0 && updatedAt) {
-      const updatedMs = Date.parse(updatedAt)
-      if (Number.isFinite(updatedMs) && Date.now() - updatedMs > ACTIVE_MAX_AGE_MS) {
+    if (ACTIVE_MAX_AGE_MS > 0) {
+      const updatedMs = updatedAt ? Date.parse(updatedAt) : Number.NaN
+      if (!Number.isFinite(updatedMs)) {
+        return { id: null, updatedAt: '', reason: 'active.json is missing a valid updatedAt timestamp' }
+      }
+      if (Date.now() - updatedMs > ACTIVE_MAX_AGE_MS) {
         const mins = Math.round((Date.now() - updatedMs) / 60_000)
         return {
           id: null,
@@ -153,7 +189,7 @@ function formatMessage(ev) {
       safeTruncate(rawBody, MAX_BODY_CHARS) +
       `\n\n[truncated — call thread_briefing/read_thread on #${ev.thread} for full message]`
   }
-  const nonce = randomBytes(4).toString('hex')
+  const nonce = randomBytes(16).toString('hex')
   const openTag = `<<<AGORA_PEER_MESSAGE:${nonce}>>>`
   const closeTag = `<<<END_AGORA_PEER_MESSAGE:${nonce}>>>`
   const safeBody = neutralizePeerBody(rawBody)
@@ -202,7 +238,7 @@ function deliverEvent(ev) {
 
   if (!allowWakeForThread(ev.thread, target.updatedAt)) {
     log(
-      `auto-wake cap (${MAX_WAKES_PER_THREAD}/10m, 60m latch) active for thread #${ev.thread}; leaving msg #${ev.msg} in pending queries.`,
+      `auto-wake cap (${MAX_WAKES_PER_THREAD}/thread, ${MAX_GLOBAL_WAKES}/global, 60m latch) active for thread #${ev.thread}; leaving msg #${ev.msg} in pending queries.`,
     )
     return
   }
@@ -238,6 +274,7 @@ process.on('SIGTERM', shutdown)
 
 function startTail() {
   if (stopping) return
+  const startedAt = Date.now()
   const argv = [
     'tail',
     '--agent',
@@ -245,19 +282,18 @@ function startTail() {
     '--parent-pid',
     String(process.pid),
     '--exit-on-stdin-eof',
+    '--emit-ready',
   ]
   if (AGORA_DB.length > 0) argv.push('--db', AGORA_DB)
 
-  if (lastMsgSeq > 0) {
+  if (hasCursor) {
     argv.push('--since', String(lastMsgSeq))
+    argv.push('--since-turn', String(lastTurnSeq))
   } else if (!initialSinceConsumed && process.env.AGORA_SINCE) {
     argv.push('--since', process.env.AGORA_SINCE)
   }
   initialSinceConsumed = true
 
-  if (lastTurnSeq > 0) {
-    argv.push('--since-turn', String(lastTurnSeq))
-  }
   if (process.env.AGORA_ONCE === '1') argv.push('--once')
 
   log(`starting: ${AGORA_EXE} ${argv.join(' ')}`)
@@ -270,7 +306,6 @@ function startTail() {
   let buffer = ''
   proc.stdout.setEncoding('utf-8')
   proc.stdout.on('data', (chunk) => {
-    backoffMs = 2000
     buffer += chunk
     let nl = buffer.indexOf('\n')
     while (nl >= 0) {
@@ -280,10 +315,17 @@ function startTail() {
       if (line.length === 0) continue
       try {
         const ev = JSON.parse(line)
+        if (ev.kind === 'ready') {
+          if (typeof ev.seq === 'number' && ev.seq >= lastMsgSeq) lastMsgSeq = ev.seq
+          if (typeof ev.turn_seq === 'number' && ev.turn_seq >= lastTurnSeq) lastTurnSeq = ev.turn_seq
+          hasCursor = true
+          continue
+        }
+        deliverEvent(ev)
         if (typeof ev.msg === 'number' && ev.msg > lastMsgSeq) lastMsgSeq = ev.msg
         else if (typeof ev.seq === 'number' && ev.seq > lastMsgSeq) lastMsgSeq = ev.seq
         if (typeof ev.turn_seq === 'number' && ev.turn_seq > lastTurnSeq) lastTurnSeq = ev.turn_seq
-        deliverEvent(ev)
+        hasCursor = true
       } catch (err) {
         log(`bad JSON line from agora tail: ${err.message}`)
       }
@@ -305,6 +347,20 @@ function startTail() {
     if (stopping || process.env.AGORA_ONCE === '1') {
       process.exit(code ?? 0)
       return
+    }
+    if (code === 2) {
+      consecutiveUsageErrors += 1
+      if (consecutiveUsageErrors >= 3) {
+        log('agora tail exited with code 2 three times (possible version skew); exiting to avoid spin.')
+        process.exit(2)
+        return
+      }
+    } else {
+      consecutiveUsageErrors = 0
+    }
+
+    if (Date.now() - startedAt >= STABLE_UPTIME_MS) {
+      backoffMs = 2000
     }
     log(`agora tail exited (code=${code}, signal=${signal}); restarting in ${backoffMs}ms`)
     const delay = backoffMs

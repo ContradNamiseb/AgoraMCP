@@ -1,9 +1,10 @@
 // Agora direct-notification mod for Claude Code (CLI, Desktop, VS Code).
-// Spawns hub-less `agora tail --agent <name> --exit-with-parent` on interactive
-// or attached GUI sessions (0% CPU kernel wait on NamedBoardEvent) and wakes
-// idle sessions via $.prompt.submit whenever a peer DM, directed board post, or
-// turn pass lands — with cursor continuity across restarts, nonce-delimited
-// untrusted peer-data framing, and a latching per-thread loop breaker.
+// Spawns hub-less `agora tail --agent <name> --exit-with-parent --emit-ready`
+// on interactive or attached GUI sessions (0% CPU kernel wait on NamedBoardEvent)
+// and wakes idle sessions via $.prompt.submit — with initial-cursor handshake
+// across restarts (I2), 128-bit nonce peer framing (H1/L8), stderr/version-skew
+// visibility (I6), flap-resistant backoff (I7), and per-thread + global
+// latching loop breakers (I4).
 
 let enabled = true
 let activeStream = null
@@ -16,16 +17,22 @@ let activeAgent = 'claudecode'
 let activeExe = ''
 let lastMsgSeq = 0
 let lastTurnSeq = 0
+let hasCursor = false
 let maxWakesPerThread = 6
+let maxGlobalWakes = 15
 const MAX_BODY_CHARS = 3000
+const MAX_TOPIC_CHARS = 80
 const WAKE_WINDOW_MS = 10 * 60 * 1000
 const WAKE_COOLDOWN_MS = 60 * 60 * 1000
+const STABLE_UPTIME_MS = 10 * 1000
 const wakeHistory = new Map()
 const latchedUntil = new Map()
+let globalWakeHistory = []
+let globalLatchedUntil = 0
 const pendingPrompts = []
 
 function makeNonce() {
-  const bytes = new Uint8Array(4)
+  const bytes = new Uint8Array(16)
   crypto.getRandomValues(bytes)
   let out = ''
   for (let i = 0; i < bytes.length; i += 1) {
@@ -50,49 +57,73 @@ function sanitizeIdentifier(value, fallback) {
 
 function sanitizeInline(value, fallback) {
   const cleaned = String(value || '')
-    .replace(/[\r\n]+/g, ' ')
+    .replace(/\p{Cf}/gu, '')
+    .replace(/[\p{Cc}\p{Zl}\p{Zp}\s]+/gu, ' ')
     .replace(/"/g, "'")
     .trim()
-  return cleaned.length > 0 ? cleaned : fallback
+  if (cleaned.length === 0) return fallback
+  return cleaned.length <= MAX_TOPIC_CHARS ? cleaned : safeTruncate(cleaned, MAX_TOPIC_CHARS - 1) + '…'
 }
 
 function neutralizePeerBody(body) {
   const normalized = String(body || '')
     .replace(/\r\n/g, '\n')
-    .replace(/\r/g, '\n')
+    .replace(/\p{Cf}/gu, '')
+    .replace(/[\r\v\f\u0085\p{Zl}\p{Zp}]/gu, '\n')
     .replace(/<<<AGORA_PEER_MESSAGE/gi, '[agora-peer-marker-escaped]')
     .replace(/<<<END_AGORA_PEER_MESSAGE/gi, '[agora-peer-end-escaped]')
 
   return normalized
     .split('\n')
-    .map((line) => (/^\[Agora\s/i.test(line.trimStart()) ? '> ' + line : line))
+    .map((line) => (/^\[Agora[\s\t]/i.test(line.trimStart()) ? '> ' + line : line))
     .join('\n')
 }
 
 function allowWakeForThread(threadId, nowMs) {
-  if (maxWakesPerThread <= 0) return true
-  const key = String(threadId ?? 0)
-
-  const until = latchedUntil.get(key)
-  if (until !== undefined) {
-    if (nowMs < until) return false
-    latchedUntil.delete(key)
-  }
-
   const cutoff = nowMs - WAKE_WINDOW_MS
-  const list = (wakeHistory.get(key) || []).filter((ts) => ts >= cutoff)
-  if (list.length >= maxWakesPerThread) {
-    latchedUntil.set(key, nowMs + WAKE_COOLDOWN_MS)
-    wakeHistory.set(key, [])
-    return false
+
+  if (maxGlobalWakes > 0) {
+    if (globalLatchedUntil > 0) {
+      if (nowMs < globalLatchedUntil) return false
+      globalLatchedUntil = 0
+    }
+    globalWakeHistory = globalWakeHistory.filter((ts) => ts >= cutoff)
+    if (globalWakeHistory.length >= maxGlobalWakes) {
+      globalLatchedUntil = nowMs + WAKE_COOLDOWN_MS
+      globalWakeHistory = []
+      return false
+    }
   }
-  list.push(nowMs)
-  if (list.length >= maxWakesPerThread) {
-    // Latch after this final allowed wake so the next automated bounce hits cooldown.
-    latchedUntil.set(key, nowMs + WAKE_COOLDOWN_MS)
-    wakeHistory.set(key, [])
-  } else {
-    wakeHistory.set(key, list)
+
+  if (maxWakesPerThread > 0) {
+    const key = String(threadId ?? 0)
+    const until = latchedUntil.get(key)
+    if (until !== undefined) {
+      if (nowMs < until) return false
+      latchedUntil.delete(key)
+    }
+
+    const list = (wakeHistory.get(key) || []).filter((ts) => ts >= cutoff)
+    if (list.length >= maxWakesPerThread) {
+      latchedUntil.set(key, nowMs + WAKE_COOLDOWN_MS)
+      wakeHistory.set(key, [])
+      return false
+    }
+    list.push(nowMs)
+    if (list.length >= maxWakesPerThread) {
+      latchedUntil.set(key, nowMs + WAKE_COOLDOWN_MS)
+      wakeHistory.set(key, [])
+    } else {
+      wakeHistory.set(key, list)
+    }
+  }
+
+  if (maxGlobalWakes > 0) {
+    globalWakeHistory.push(nowMs)
+    if (globalWakeHistory.length >= maxGlobalWakes) {
+      globalLatchedUntil = nowMs + WAKE_COOLDOWN_MS
+      globalWakeHistory = []
+    }
   }
   return true
 }
@@ -183,6 +214,11 @@ async function ensureTailStarted($) {
     const parsed = Number.parseInt(rawCap.trim(), 10)
     if (Number.isFinite(parsed) && parsed >= 0) maxWakesPerThread = parsed
   }
+  const rawGlobalCap = (await $.env.get('AGORA_MAX_GLOBAL_WAKES')) || ''
+  if (rawGlobalCap.trim().length > 0) {
+    const parsed = Number.parseInt(rawGlobalCap.trim(), 10)
+    if (Number.isFinite(parsed) && parsed >= 0) maxGlobalWakes = parsed
+  }
 
   loopGeneration += 1
   const gen = loopGeneration
@@ -191,28 +227,48 @@ async function ensureTailStarted($) {
 
 async function runTailLoop($, generation, exe, agent, dbPath) {
   let backoffMs = 2000
+  let consecutiveUsageErrors = 0
 
   while (!stopping && generation === loopGeneration) {
     let buffer = ''
-    const argv = [exe, 'tail', '--agent', agent, '--exit-with-parent']
+    let stderrLogged = 0
+    const startedAt = await $.clock.now()
+    const argv = [exe, 'tail', '--agent', agent, '--exit-with-parent', '--emit-ready']
     if (dbPath && dbPath.trim().length > 0) {
       argv.push('--db', dbPath.trim())
     }
-    if (lastMsgSeq > 0) {
+    if (hasCursor) {
       argv.push('--since', String(lastMsgSeq))
-    }
-    if (lastTurnSeq > 0) {
       argv.push('--since-turn', String(lastTurnSeq))
     }
 
+    let exitCode = null
     try {
       const stream = $.process.spawn({ argv })
       activeStream = stream
-      backoffMs = 2000
 
-      for await (const chunk of stream) {
+      let iter = await stream.next()
+      while (!iter.done) {
         if (stopping || generation !== loopGeneration) break
-        if (chunk.stream !== 'stdout') continue
+        const chunk = iter.value
+        if (chunk.stream === 'stderr') {
+          const msg = (chunk.text || '').trim()
+          if (msg.length > 0 && stderrLogged < 5) {
+            stderrLogged += 1
+            try {
+              $.ui.log('agora tail stderr: ' + msg.slice(0, 240))
+            } catch {
+              // Ignore logging failures.
+            }
+          }
+          iter = await stream.next()
+          continue
+        }
+        if (chunk.stream !== 'stdout') {
+          iter = await stream.next()
+          continue
+        }
+
         buffer += chunk.text
         let nl = buffer.indexOf('\n')
         while (nl >= 0) {
@@ -228,9 +284,13 @@ async function runTailLoop($, generation, exe, agent, dbPath) {
             continue
           }
 
-          if (typeof ev.msg === 'number' && ev.msg > lastMsgSeq) lastMsgSeq = ev.msg
-          else if (typeof ev.seq === 'number' && ev.seq > lastMsgSeq) lastMsgSeq = ev.seq
-          if (typeof ev.turn_seq === 'number' && ev.turn_seq > lastTurnSeq) lastTurnSeq = ev.turn_seq
+          // I2: initial ready handshake captures MAX(id) cursors before first real event.
+          if (ev.kind === 'ready') {
+            if (typeof ev.seq === 'number' && ev.seq >= lastMsgSeq) lastMsgSeq = ev.seq
+            if (typeof ev.turn_seq === 'number' && ev.turn_seq >= lastTurnSeq) lastTurnSeq = ev.turn_seq
+            hasCursor = true
+            continue
+          }
 
           receivedCount += 1
           const nowMs = await $.clock.now()
@@ -247,7 +307,17 @@ async function runTailLoop($, generation, exe, agent, dbPath) {
           if (canWake) {
             void submitPrompt($, formatEventPrompt(ev))
           }
+
+          // Advance cursors after handling event.
+          if (typeof ev.msg === 'number' && ev.msg > lastMsgSeq) lastMsgSeq = ev.msg
+          else if (typeof ev.seq === 'number' && ev.seq > lastMsgSeq) lastMsgSeq = ev.seq
+          if (typeof ev.turn_seq === 'number' && ev.turn_seq > lastTurnSeq) lastTurnSeq = ev.turn_seq
+          hasCursor = true
         }
+        iter = await stream.next()
+      }
+      if (iter.done && iter.value && typeof iter.value.code === 'number') {
+        exitCode = iter.value.code
       }
     } catch (error) {
       if (stopping || generation !== loopGeneration) break
@@ -269,6 +339,29 @@ async function runTailLoop($, generation, exe, agent, dbPath) {
     }
 
     if (stopping || generation !== loopGeneration) break
+
+    // I6: stop retrying forever if agora.exe exits 2 (version skew / unsupported flag).
+    if (exitCode === 2) {
+      consecutiveUsageErrors += 1
+      if (consecutiveUsageErrors >= 3) {
+        try {
+          $.ui.log('agora tail exited with code 2 three times (possible version skew); stopping auto-restart. Update agora.exe and run /agora-notify on.')
+        } catch {
+          // Ignore logging errors.
+        }
+        tailStarted = false
+        return
+      }
+    } else {
+      consecutiveUsageErrors = 0
+    }
+
+    // I7: only reset backoff when child stayed healthy for >= 10s.
+    const endedAt = await $.clock.now()
+    if (endedAt - startedAt >= STABLE_UPTIME_MS) {
+      backoffMs = 2000
+    }
+
     await $.clock.sleep(backoffMs)
     backoffMs = Math.min(backoffMs * 2, 30000)
   }
@@ -320,12 +413,13 @@ export function register(on) {
     return res
   })
 
-  // Any human composer prompt resets latched loop-breaker cooldowns.
   on('prompt.submit', ($, e, next) => {
     try {
       if (e?.origin?.kind === 'composer') {
         wakeHistory.clear()
         latchedUntil.clear()
+        globalWakeHistory = []
+        globalLatchedUntil = 0
       }
     } catch {
       // Never block prompt submission.
@@ -343,6 +437,8 @@ export function register(on) {
       enabled = true
       wakeHistory.clear()
       latchedUntil.clear()
+      globalWakeHistory = []
+      globalLatchedUntil = 0
       await ensureTailStarted($)
       return { text: `Agora auto-wake active for '${activeAgent}' (rate caps reset).` }
     }

@@ -52,11 +52,15 @@ public static class NotifyHub
         public int PollMs { get; init; } = 1000;
     }
 
+    private const int MaxSubscriberQueue = 500;
+    private const int MaxHttpHeaderLines = 64;
+    private const int MaxHttpLineChars = 8192;
+
     private sealed class Subscriber
     {
         public required string Agent { get; init; }
         public long Cursor;
-        public BlockingCollection<string> Queue { get; } = new(new ConcurrentQueue<string>());
+        public BlockingCollection<string> Queue { get; } = new(new ConcurrentQueue<string>(), MaxSubscriberQueue);
     }
 
     public static async Task<int> RunAsync(Options options, CancellationToken token)
@@ -112,9 +116,16 @@ public static class NotifyHub
             using (client)
             await using (var stream = client.GetStream())
             {
+                using var handshakeCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+                handshakeCts.CancelAfter(TimeSpan.FromSeconds(5));
                 var reader = new StreamReader(stream, Encoding.ASCII, leaveOpen: true);
-                var requestLine = await reader.ReadLineAsync(token) ?? "";
-                string? line;
+                var requestLine = await ReadBoundedLineAsync(reader, MaxHttpLineChars, handshakeCts.Token);
+                if (requestLine is null)
+                {
+                    await WriteRawAsync(stream, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", token);
+                    return;
+                }
+
                 var query = "";
                 var parts = requestLine.Split(' ');
                 if (parts.Length >= 2)
@@ -132,22 +143,51 @@ public static class NotifyHub
                 {
                     return;
                 }
-                // Drain request headers.
-                while (!string.IsNullOrEmpty(line = await reader.ReadLineAsync(token))) { }
+
+                // Read headers with strict line/length bounds and validate Host + Origin
+                // to prevent browser DNS-rebinding reads against loopback SSE (M3).
+                string? hostHeader = null;
+                string? originHeader = null;
+                var headerCount = 0;
+                while (true)
+                {
+                    var line = await ReadBoundedLineAsync(reader, MaxHttpLineChars, handshakeCts.Token);
+                    if (line is null)
+                    {
+                        await WriteRawAsync(stream, "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", token);
+                        return;
+                    }
+                    if (line.Length == 0) break;
+                    headerCount += 1;
+                    if (headerCount > MaxHttpHeaderLines)
+                    {
+                        await WriteRawAsync(stream, "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", token);
+                        return;
+                    }
+                    var colon = line.IndexOf(':');
+                    if (colon > 0)
+                    {
+                        var hName = line[..colon].Trim();
+                        var hVal = line[(colon + 1)..].Trim();
+                        if (hName.Equals("Host", StringComparison.OrdinalIgnoreCase)) hostHeader = hVal;
+                        else if (hName.Equals("Origin", StringComparison.OrdinalIgnoreCase)) originHeader = hVal;
+                    }
+                }
+
+                if (!IsAllowedLoopbackHost(hostHeader) || !IsAllowedLoopbackOrigin(originHeader))
+                {
+                    await WriteRawAsync(stream, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", token);
+                    return;
+                }
+
                 var q = ParseQuery(query);
                 var agent = q.GetValueOrDefault("agent", "");
                 var since = long.TryParse(q.GetValueOrDefault("since", "0"), out var s) ? s : 0;
                 var sub = new Subscriber { Agent = agent.Trim(), Cursor = since };
                 subscribers[id] = sub;
-                // Immediate catch-up replay from the durable log. The cursor
-                // MUST advance past replayed rows here: the pump delivers
-                // everything above the cursor, so replaying without advancing
-                // double-delivers the whole window (observed live: one post,
-                // two deliveries with the same seq). Replay sets the floor;
-                // the pump owns everything above it from here on.
                 foreach (var (replayLine, replaySeq, _, _, _) in ReadSince(options.DbPath, since, agent))
                 {
-                    sub.Queue.Add(replayLine);
+                    if (!sub.Queue.TryAdd(replayLine)) break;
                     if (replaySeq > sub.Cursor) sub.Cursor = replaySeq;
                 }
                 await WriteRawAsync(stream,
@@ -218,6 +258,53 @@ public static class NotifyHub
         return stream.WriteAsync(bytes, 0, bytes.Length, token);
     }
 
+    private static async Task<string?> ReadBoundedLineAsync(StreamReader reader, int maxChars, CancellationToken token)
+    {
+        var sb = new StringBuilder();
+        var buf = new char[1];
+        while (true)
+        {
+            var n = await reader.ReadAsync(buf.AsMemory(0, 1), token);
+            if (n == 0) return sb.Length == 0 ? "" : sb.ToString();
+            var ch = buf[0];
+            if (ch == '\n')
+            {
+                if (sb.Length > 0 && sb[^1] == '\r') sb.Length -= 1;
+                return sb.ToString();
+            }
+            if (sb.Length >= maxChars) return null;
+            sb.Append(ch);
+        }
+    }
+
+    internal static bool IsAllowedLoopbackHost(string? hostHeader)
+    {
+        if (string.IsNullOrWhiteSpace(hostHeader)) return true; // HTTP/1.0 without Host
+        var raw = hostHeader.Trim();
+        if (Uri.TryCreate($"http://{raw}/", UriKind.Absolute, out var uri))
+            return IsLoopbackHostname(uri.Host);
+        return false;
+    }
+
+    internal static bool IsAllowedLoopbackOrigin(string? originHeader)
+    {
+        if (string.IsNullOrWhiteSpace(originHeader)) return true; // non-browser CLI/SSE clients omit Origin
+        if (Uri.TryCreate(originHeader.Trim(), UriKind.Absolute, out var uri) &&
+            (uri.Scheme.Equals("http", StringComparison.OrdinalIgnoreCase) ||
+             uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase)))
+        {
+            return IsLoopbackHostname(uri.Host);
+        }
+        return false;
+    }
+
+    internal static bool IsLoopbackHostname(string host)
+    {
+        var h = (host ?? "").Trim().Trim('[', ']');
+        if (h.Equals("localhost", StringComparison.OrdinalIgnoreCase)) return true;
+        return IPAddress.TryParse(h, out var ip) && IPAddress.IsLoopback(ip);
+    }
+
     private static async Task PumpLoopAsync(Options options,
         ConcurrentDictionary<Guid, Subscriber> subscribers, DesktopToast? toast, CancellationToken token)
     {
@@ -254,8 +341,8 @@ public static class NotifyHub
                     {
                         if (seq <= sub.Cursor) continue;
                         if (sub.Agent.Length > 0 && to.Length > 0 && !AgentIdentity.AnswersTo(sub.Agent, to)) continue;
-                        sub.Queue.Add(line);
-                        sub.Cursor = seq;
+                        if (sub.Queue.TryAdd(line))
+                            sub.Cursor = seq;
                     }
                 }
                 if (rows.Count > 0) toastCursor = rows[^1].Seq;
@@ -443,9 +530,9 @@ public static class NotifyHub
         bool dmsOnly,
         bool excludeSelf)
     {
-        // Resolve the turn pass active AS OF each message m (not the newest turn
-        // pass on the thread at read time) so late reads, hook batches, and
-        // --since replays route identically to live delivery.
+        // Resolve the turn pass active AS OF each message m using only message-id
+        // ordering (S2 + S5 + I9: migration backfills at_msg_id and a trigger
+        // populates it for older writers, so clock steps never affect routing).
         var rows = db.Prepare("""
             SELECT m.id, m.thread_id, m.author, m.kind, m.body,
                    t.topic, t.created_by, t.directed_to, t.kind AS thread_kind,
@@ -455,7 +542,6 @@ public static class NotifyHub
                          AND (
                            te.msg_id = m.id
                            OR (te.at_msg_id > 0 AND te.at_msg_id < m.id)
-                           OR (te.at_msg_id = 0 AND te.created_at <= m.created_at)
                          )
                        ORDER BY te.id DESC LIMIT 1
                    ), 0) AS asof_turn_id,

@@ -43,6 +43,8 @@ public static partial class BoardTail
         public bool ExitWithParent { get; init; }
         /// <summary>Exit cleanly when stdin reaches EOF (for hosts that keep a stdin pipe open).</summary>
         public bool ExitOnStdinEof { get; init; }
+        /// <summary>Emit an initial {"kind":"ready","seq":...,"turn_seq":...} control line right after cursor sampling (I2).</summary>
+        public bool EmitReady { get; init; }
     }
 
     public static async Task<int> RunAsync(
@@ -105,6 +107,19 @@ public static partial class BoardTail
             var cursor = options.Since ?? NotifyHub.ReadMaxSeq(dbPath);
             var turnCursor = options.SinceTurn
                 ?? (options.Since == 0 ? 0 : NotifyHub.ReadMaxTurnSeq(dbPath));
+
+            NotifyLog.Write("tail", agent, "started", cursor, turnCursor);
+
+            if (options.EmitReady)
+            {
+                output.WriteLine(JsonSerializer.Serialize(new
+                {
+                    kind = "ready",
+                    seq = cursor,
+                    turn_seq = turnCursor,
+                }));
+                output.Flush();
+            }
 
             var deadline = options.TimeoutSeconds is > 0
                 ? DateTime.UtcNow.AddSeconds(options.TimeoutSeconds.Value)

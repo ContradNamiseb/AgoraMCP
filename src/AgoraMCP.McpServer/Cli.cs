@@ -419,8 +419,9 @@ internal static class Cli
                [--dms-only] [--all] [--once] incoming DMs, directed mail, and turn passes
                [--timeout S] [--interval S]  (starts at now unless --since is given);
                [--parent-pid PID]            --exit-with-parent / --parent-pid /
-               [--exit-with-parent]          --exit-on-stdin-eof exit when host dies
-               [--exit-on-stdin-eof]
+               [--exit-with-parent]          --exit-on-stdin-eof exit when host dies;
+               [--exit-on-stdin-eof]         --emit-ready prints initial cursor handshake
+               [--emit-ready]
           hook-check --agent NAME            lifecycle hook check for SessionStart,
                [--format FMT] [--event EV]   UserPromptSubmit, PostToolUse, and Stop across
                [--record-session]            Codex, Cursor, VS Code, Copilot, Kimi, ZCode,
@@ -429,12 +430,14 @@ internal static class Cli
           bridge --client codex|kimi-web|opencode
                [--agent NAME] [--session ID] hub-less idle-wake dispatcher waiting on
                [--session-file P] [--url U]  NamedBoardEvent (0% CPU) and injecting mail via
-               [--session-max-age-sec S]     sanctioned client APIs (native codex.exe queue,
-               [--token T] [--exe PATH]      kimi web REST, opencode HTTP); --max-wakes
-               [--max-wakes N] [--dms-only]  latches a thread into 60m cooldown (default 6,
-               [--parent-pid PID]            0=unlimited); --exit-with-parent / --parent-pid
-               [--exit-with-parent]          / --exit-on-stdin-eof exit when host dies
-               [--exit-on-stdin-eof] [--once] [--dry-run] [--timeout S]
+               [--session-max-age-sec S]     sanctioned loopback APIs (native codex.exe queue,
+               [--token-file P] [--token T]  kimi web REST, opencode HTTP); --max-wakes /
+               [--exe PATH] [--max-wakes N]  --max-global-wakes latch 60m cooldowns;
+               [--max-global-wakes N]        --exit-with-parent / --parent-pid /
+               [--parent-pid PID] [--once]   --exit-on-stdin-eof exit when host dies
+               [--exit-with-parent] [--exit-on-stdin-eof] [--dms-only] [--all] [--dry-run] [--timeout S]
+          doctor [--db PATH]                 inspect build, WAL/schema version, live event
+                                             listeners, session beacons, hooks, and notify.log
 
         The database is shared by convention: --db flag, then $AGORA_DB, then
         %LOCALAPPDATA%\AgoraMCP\agora.db. Every agent that wants to share the

@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
@@ -14,14 +15,15 @@ namespace AgoraMCP.McpServer.Notify;
 ///
 /// <list type="bullet">
 ///   <item><c>codex</c>: <c>codex queue --thread &lt;id&gt; --message &lt;text&gt;</c> (native .exe only; refuses .cmd/.bat wrappers)</item>
-///   <item><c>kimi-web</c>: <c>POST /api/v1/sessions/{id}/prompts</c> on local <c>kimi web</c> (Bearer token)</item>
-///   <item><c>opencode</c>: <c>POST /session/{id}/prompt_async</c> over local HTTP (default http://127.0.0.1:4096 + service.json Basic auth)</item>
+///   <item><c>kimi-web</c>: <c>POST /api/v1/sessions/{id}/prompts</c> on loopback <c>kimi web</c> (Bearer token, no redirects)</item>
+///   <item><c>opencode</c>: <c>POST /session/{id}/prompt_async</c> on loopback HTTP (default http://127.0.0.1:4096 + service.json Basic auth, no redirects)</item>
 /// </list>
 ///
 /// <para>Requires either an explicit <c>--session</c> or a fresh active-session
-/// beacon written by <c>agora hook-check --record-session</c>
-/// (<c>%LOCALAPPDATA%\AgoraMCP\sessions\&lt;agent&gt;.json</c>); never guesses an
-/// unrelated session from disk or server listings.</para>
+/// beacon written by <c>agora hook-check --record-session</c>; never guesses an
+/// unrelated session, refuses non-loopback HTTP targets (M2), validates session
+/// IDs against leading-dash flag injection (L6), and enforces both per-thread
+/// and global latching loop breakers (I4).</para>
 /// </summary>
 public static class ClientBridge
 {
@@ -29,8 +31,13 @@ public static class ClientBridge
     public const string DefaultOpenCodeUrl = "http://127.0.0.1:4096";
     public const double DefaultSessionMaxAgeSeconds = 4 * 60 * 60; // 4 hours
     public const double DefaultWakeCooldownSeconds = 60 * 60; // 60 min loop-breaker latch
+    public const int DefaultMaxGlobalWakes = 15;
 
-    private static readonly HttpClient SharedHttp = new()
+    // M2: never follow HTTP redirects with Authorization headers attached.
+    private static readonly HttpClient SharedHttp = new(new SocketsHttpHandler
+    {
+        AllowAutoRedirect = false,
+    })
     {
         Timeout = TimeSpan.FromSeconds(15),
     };
@@ -48,10 +55,12 @@ public static class ClientBridge
         public string? SessionFilePath { get; init; }
         /// <summary>Reject beacon files older than this many seconds (0 = no expiry; default 4h).</summary>
         public double SessionMaxAgeSeconds { get; init; } = DefaultSessionMaxAgeSeconds;
-        /// <summary>Optional HTTP server URL (kimi-web / opencode).</summary>
+        /// <summary>Optional loopback HTTP server URL (kimi-web / opencode).</summary>
         public string? ServerUrl { get; init; }
-        /// <summary>Optional Bearer token override (kimi-web) or Basic password (opencode).</summary>
+        /// <summary>Optional Bearer token / Basic password override (prefer --token-file or env var to avoid argv exposure).</summary>
         public string? AuthToken { get; init; }
+        /// <summary>Optional path to a file containing the Bearer token / Basic password (M4).</summary>
+        public string? AuthTokenFile { get; init; }
         /// <summary>Optional CLI executable path override (codex; .cmd/.bat wrappers are refused).</summary>
         public string? ExecutablePath { get; init; }
         /// <summary>Optional Kimi home directory override (for testing; defaults to ~/.kimi-code).</summary>
@@ -68,13 +77,15 @@ public static class ClientBridge
         public double IntervalSeconds { get; init; } = NamedBoardEvent.IsSupported ? 5 : 1;
         /// <summary>Per-thread wake cap before latching into cooldown (0 = unlimited).</summary>
         public int MaxWakesPerThread { get; init; } = 6;
-        /// <summary>Window duration in seconds for counting wakes toward <see cref="MaxWakesPerThread"/>.</summary>
+        /// <summary>Global wake cap across all threads before latching into cooldown (0 = unlimited, I4).</summary>
+        public int MaxGlobalWakes { get; init; } = DefaultMaxGlobalWakes;
+        /// <summary>Window duration in seconds for counting wakes toward caps.</summary>
         public double WakeWindowSeconds { get; init; } = 600;
-        /// <summary>Latch duration in seconds once a thread trips <see cref="MaxWakesPerThread"/>.</summary>
+        /// <summary>Latch duration in seconds once a thread or global cap trips.</summary>
         public double WakeCooldownSeconds { get; init; } = DefaultWakeCooldownSeconds;
         /// <summary>Exit cleanly if this parent PID exits.</summary>
         public int? ParentPid { get; init; }
-        /// <summary>Auto-detect own parent PID on Windows/Linux and exit cleanly if it terminates.</summary>
+        /// <summary>Auto-detect own parent PID on Windows/Linux/macOS and exit cleanly if it terminates.</summary>
         public bool ExitWithParent { get; init; }
         /// <summary>Exit cleanly when stdin reaches EOF.</summary>
         public bool ExitOnStdinEof { get; init; }
@@ -106,6 +117,44 @@ public static class ClientBridge
             "opencode" => "opencode",
             _ => normalizedClient,
         };
+
+    /// <summary>
+    /// Validates a session/thread ID against empty values, whitespace/control chars,
+    /// and leading dashes (L6: prevents a crafted session_id from being parsed as
+    /// a CLI option such as --dangerously-bypass-approvals-and-sandbox).
+    /// </summary>
+    public static bool IsSafeSessionId(string? sessionId)
+    {
+        if (string.IsNullOrWhiteSpace(sessionId)) return false;
+        var s = sessionId.Trim();
+        if (s.Length > 200 || s.StartsWith('-')) return false;
+        foreach (var ch in s)
+        {
+            if (char.IsControl(ch) || char.IsWhiteSpace(ch)) return false;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Enforces loopback-only HTTP/HTTPS targets before attaching credentials (M2).
+    /// </summary>
+    public static (string? NormalizedUrl, string? Error) ValidateLoopbackUrl(string rawUrl)
+    {
+        var trimmed = (rawUrl ?? "").Trim();
+        if (!Uri.TryCreate(trimmed, UriKind.Absolute, out var uri))
+            return (null, $"invalid server URL '{rawUrl}'");
+        if (!uri.Scheme.Equals("http", StringComparison.OrdinalIgnoreCase) &&
+            !uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase))
+        {
+            return (null, $"refusing unsupported URL scheme '{uri.Scheme}' in '{rawUrl}'");
+        }
+        if (!NotifyHub.IsLoopbackHostname(uri.Host))
+        {
+            return (null,
+                $"refusing non-loopback target '{uri.Host}' in '{rawUrl}' (credentials are only sent to loopback 127.0.0.1/localhost/::1)");
+        }
+        return (trimmed.TrimEnd('/'), null);
+    }
 
     public static async Task<int> RunAsync(
         Options options,
@@ -143,7 +192,7 @@ public static class ClientBridge
         }
 
         var dbPath = Path.GetFullPath(options.DbPath);
-        var listenerId = $"bridge-{client}-{HookCheck.SanitizeFileSegment(agent)}-{Environment.ProcessId}-{Guid.NewGuid().ToString("N")[..8]}";
+        var listenerId = $"bridge-{client}-{HookCheck.AgentFileKey(agent)}-{Environment.ProcessId}-{Guid.NewGuid().ToString("N")[..8]}";
         EventWaitHandle? ownEvent = null;
 
         try
@@ -169,9 +218,12 @@ public static class ClientBridge
             var fallback = TimeSpan.FromSeconds(Math.Clamp(options.IntervalSeconds, 0.1, 60));
             var wakeHistory = new Dictionary<long, Queue<DateTime>>();
             var latchedUntil = new Dictionary<long, DateTime>();
+            var globalHistory = new Queue<DateTime>();
+            DateTime? globalLatchedUntil = null;
 
             err.WriteLine($"bridge: watching '{agent}' for client '{client}' (cursor={cursor}, turn={turnCursor}, db={dbPath}{(options.DryRun ? ", dry-run" : "")})");
             err.Flush();
+            NotifyLog.Write($"bridge:{client}", agent, "started", cursor, turnCursor);
 
             var firstPass = true;
             while (!linkedToken.IsCancellationRequested)
@@ -213,67 +265,103 @@ public static class ClientBridge
                         dmsOnly: options.DmsOnly,
                         excludeSelf: true);
 
-                    if (maxSeq > cursor) cursor = maxSeq;
-                    if (maxTurnSeq > turnCursor) turnCursor = maxTurnSeq;
-
-                    if (events.Count > 0)
+                    if (events.Count == 0)
                     {
-                        var window = TimeSpan.FromSeconds(Math.Max(1, options.WakeWindowSeconds));
-                        var cooldown = TimeSpan.FromSeconds(Math.Max(1, options.WakeCooldownSeconds));
+                        if (maxSeq > cursor) cursor = maxSeq;
+                        if (maxTurnSeq > turnCursor) turnCursor = maxTurnSeq;
+                        continue;
+                    }
 
-                        // Check cap without burning a slot yet — only record successful dispatches (L11).
-                        var deliverable = FilterByWakeCap(
-                            events, wakeHistory, latchedUntil, options.MaxWakesPerThread, window, cooldown, err, client);
-                        if (deliverable.Count == 0)
+                    var window = TimeSpan.FromSeconds(Math.Max(1, options.WakeWindowSeconds));
+                    var cooldown = TimeSpan.FromSeconds(Math.Max(1, options.WakeCooldownSeconds));
+
+                    // Global loop breaker (I4)
+                    if (options.MaxGlobalWakes > 0 && globalLatchedUntil is DateTime gUntil)
+                    {
+                        if (DateTime.UtcNow < gUntil)
                         {
+                            var remMin = Math.Max(1, (int)Math.Ceiling((gUntil - DateTime.UtcNow).TotalMinutes));
+                            err.WriteLine($"bridge [{client}]: global wake cap cooldown active ({remMin}m left); leaving {events.Count} event(s) in pending queries.");
+                            err.Flush();
+                            NotifyLog.Write($"bridge:{client}", agent, $"global cooldown active ({remMin}m left)", maxSeq, maxTurnSeq);
+                            if (maxSeq > cursor) cursor = maxSeq;
+                            if (maxTurnSeq > turnCursor) turnCursor = maxTurnSeq;
                             if (options.Once) return 0;
                             continue;
                         }
-
-                        var message = HookCheck.FormatEvents(deliverable);
-                        var (sessionId, sessionError) = ResolveTargetSession(agent, options);
-                        if (string.IsNullOrWhiteSpace(sessionId) && !options.DryRun && dispatcher is null)
-                        {
-                            err.WriteLine($"bridge [{client}]: skipped — {sessionError}; mail stays in pending queries.");
-                            err.Flush();
-                            if (options.Once) return 1;
-                            continue;
-                        }
-
-                        var req = new DispatchRequest(client, agent, sessionId ?? "", message, deliverable);
-
-                        DispatchResult res;
-                        if (options.DryRun)
-                        {
-                            var detail = string.IsNullOrWhiteSpace(req.SessionId)
-                                ? $"dry-run: {sessionError ?? "no session"}; would leave {deliverable.Count} event(s) in pending queries"
-                                : $"dry-run: would deliver {deliverable.Count} event(s) to {client} session '{req.SessionId}'";
-                            res = new DispatchResult(true, detail);
-                        }
-                        else if (dispatcher is not null)
-                        {
-                            res = await dispatcher(req, linkedToken);
-                        }
-                        else
-                        {
-                            res = await DispatchAsync(req, options, linkedToken);
-                        }
-
-                        if (res.Ok)
-                        {
-                            RecordSuccessfulWake(deliverable, wakeHistory, latchedUntil, options.MaxWakesPerThread, window, cooldown);
-                        }
-
-                        err.WriteLine($"bridge [{client}]: {(res.Ok ? "ok" : "warn")} — {res.Detail}");
-                        err.Flush();
-
-                        if (options.Once) return res.Ok ? 0 : 1;
+                        globalLatchedUntil = null;
                     }
+
+                    var deliverable = FilterByWakeCap(
+                        events, wakeHistory, latchedUntil, options.MaxWakesPerThread, window, cooldown, err, client, agent);
+                    if (deliverable.Count == 0)
+                    {
+                        if (maxSeq > cursor) cursor = maxSeq;
+                        if (maxTurnSeq > turnCursor) turnCursor = maxTurnSeq;
+                        if (options.Once) return 0;
+                        continue;
+                    }
+
+                    var message = HookCheck.FormatEvents(deliverable);
+                    var (sessionId, sessionError) = ResolveTargetSession(agent, options);
+                    if (string.IsNullOrWhiteSpace(sessionId) && !options.DryRun && dispatcher is null)
+                    {
+                        err.WriteLine($"bridge [{client}]: skipped — {sessionError}; mail stays in pending queries.");
+                        err.Flush();
+                        NotifyLog.Write($"bridge:{client}", agent, $"skipped: {sessionError}", maxSeq, maxTurnSeq);
+                        if (maxSeq > cursor) cursor = maxSeq;
+                        if (maxTurnSeq > turnCursor) turnCursor = maxTurnSeq;
+                        if (options.Once) return 1;
+                        continue;
+                    }
+
+                    var req = new DispatchRequest(client, agent, sessionId ?? "", message, deliverable);
+
+                    // I1: dispatch BEFORE advancing cursors; retry once on transient failure in resident mode.
+                    DispatchResult res;
+                    if (options.DryRun)
+                    {
+                        var detail = string.IsNullOrWhiteSpace(req.SessionId)
+                            ? $"dry-run: {sessionError ?? "no session"}; would leave {deliverable.Count} event(s) in pending queries"
+                            : $"dry-run: would deliver {deliverable.Count} event(s) to {client} session '{req.SessionId}'";
+                        res = new DispatchResult(true, detail);
+                    }
+                    else
+                    {
+                        Func<Task<DispatchResult>> runOnce = dispatcher is not null
+                            ? () => dispatcher(req, linkedToken)
+                            : () => DispatchAsync(req, options, linkedToken);
+
+                        res = await runOnce();
+                        if (!res.Ok && !options.Once && dispatcher is null && !linkedToken.IsCancellationRequested)
+                        {
+                            try { await Task.Delay(500, linkedToken); }
+                            catch (OperationCanceledException) { return 0; }
+                            res = await runOnce();
+                        }
+                    }
+
+                    if (res.Ok)
+                    {
+                        RecordSuccessfulWake(
+                            deliverable, wakeHistory, latchedUntil, globalHistory, ref globalLatchedUntil,
+                            options.MaxWakesPerThread, options.MaxGlobalWakes, window, cooldown);
+                    }
+
+                    if (maxSeq > cursor) cursor = maxSeq;
+                    if (maxTurnSeq > turnCursor) turnCursor = maxTurnSeq;
+
+                    err.WriteLine($"bridge [{client}]: {(res.Ok ? "ok" : "warn")} — {res.Detail}");
+                    err.Flush();
+                    NotifyLog.Write($"bridge:{client}", agent, $"{(res.Ok ? "ok" : "warn")}: {res.Detail}", cursor, turnCursor);
+
+                    if (options.Once) return res.Ok ? 0 : 1;
                 }
                 catch (Exception e) when (e is not OperationCanceledException)
                 {
                     err.WriteLine($"bridge [{client}]: error ({e.Message}) — {(options.Once ? "aborting (--once)." : "continuing.")}");
                     err.Flush();
+                    NotifyLog.Write($"bridge:{client}", agent, $"error: {e.Message}", cursor, turnCursor);
                     if (options.Once) return 1;
                 }
 
@@ -296,12 +384,18 @@ public static class ClientBridge
     /// <summary>
     /// Resolves the target session ONLY from an explicit <c>--session</c> or a
     /// fresh beacon file (<c>--session-file</c> / <see cref="HookCheck.DefaultSessionPath"/>).
-    /// Never guesses an unrelated conversation from disk or server session lists (N9).
+    /// Rejects unsafe session IDs (e.g. starting with <c>-</c>) and missing/invalid
+    /// <c>updated_at</c> when expiry is enabled (L6 / N9).
     /// </summary>
     public static (string? SessionId, string? Reason) ResolveTargetSession(string agent, Options options)
     {
         if (!string.IsNullOrWhiteSpace(options.SessionId))
-            return (options.SessionId.Trim(), null);
+        {
+            var explicitId = options.SessionId.Trim();
+            return IsSafeSessionId(explicitId)
+                ? (explicitId, null)
+                : (null, $"invalid --session value '{explicitId}' (must not start with '-' or contain whitespace/control chars)");
+        }
 
         var sessionFile = string.IsNullOrWhiteSpace(options.SessionFilePath)
             ? HookCheck.DefaultSessionPath(agent)
@@ -312,15 +406,20 @@ public static class ClientBridge
         }
 
         var beacon = HookCheck.LoadSessionBeacon(sessionFile);
-        if (beacon is null || string.IsNullOrWhiteSpace(beacon.SessionId))
+        if (beacon is null || !IsSafeSessionId(beacon.SessionId))
         {
             return (null, $"session beacon '{sessionFile}' has no valid session_id");
         }
 
-        if (options.SessionMaxAgeSeconds > 0 && !string.IsNullOrWhiteSpace(beacon.UpdatedAt) &&
-            DateTimeOffset.TryParse(beacon.UpdatedAt, CultureInfo.InvariantCulture,
-                DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var updatedAt))
+        if (options.SessionMaxAgeSeconds > 0)
         {
+            if (string.IsNullOrWhiteSpace(beacon.UpdatedAt) ||
+                !DateTimeOffset.TryParse(beacon.UpdatedAt, CultureInfo.InvariantCulture,
+                    DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var updatedAt))
+            {
+                return (null, $"session beacon '{sessionFile}' is missing a valid updated_at timestamp");
+            }
+
             var age = DateTimeOffset.UtcNow - updatedAt;
             if (age.TotalSeconds > options.SessionMaxAgeSeconds)
             {
@@ -345,21 +444,12 @@ public static class ClientBridge
     public static IReadOnlyList<string> BuildCodexQueueArgs(string threadId, string message) =>
         ["queue", "--thread", threadId, "--message", message];
 
-    /// <summary>
-    /// Resolves a native executable path while strictly refusing Windows
-    /// <c>.cmd</c> / <c>.bat</c> batch wrappers (N1 / CVE-2024-27980 class),
-    /// because Windows launches batch files through <c>cmd.exe</c> where peer
-    /// message characters such as <c>&amp; | &gt; ^ %</c> and newlines break
-    /// quoting and allow command injection.
-    /// </summary>
     public static (string? ResolvedPath, string? Error) ResolveSafeExecutable(string requestedExe)
     {
         var exe = (requestedExe ?? "").Trim();
         if (exe.Length == 0)
             return (null, "executable path is empty");
 
-        // Windows strips trailing dots and spaces when opening files (e.g. "codex.cmd."),
-        // so normalize before checking extension (R6).
         var normalizedForExt = exe.TrimEnd('.', ' ');
         var ext = Path.GetExtension(normalizedForExt);
         if (ext.Equals(".cmd", StringComparison.OrdinalIgnoreCase) ||
@@ -381,7 +471,6 @@ public static class ClientBridge
         if (!OperatingSystem.IsWindows())
             return (exe, null);
 
-        // Search PATH explicitly for a real .exe, skipping any .cmd/.bat npm shim.
         var pathEnv = Environment.GetEnvironmentVariable("PATH") ?? "";
         var dirs = pathEnv.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         var sawBatchShim = (string?)null;
@@ -422,10 +511,10 @@ public static class ClientBridge
     internal static async Task<DispatchResult> DispatchCodexAsync(
         DispatchRequest request, Options options, CancellationToken token)
     {
-        if (string.IsNullOrWhiteSpace(request.SessionId))
+        if (!IsSafeSessionId(request.SessionId))
         {
             return new DispatchResult(false,
-                "no active Codex thread ID (pass --session <UUID>, or install Codex hooks with --record-session)");
+                "invalid or missing Codex thread ID (pass --session <UUID>, or install Codex hooks with --record-session)");
         }
 
         var requestedExe = string.IsNullOrWhiteSpace(options.ExecutablePath) ? "codex" : options.ExecutablePath.Trim();
@@ -446,16 +535,20 @@ public static class ClientBridge
     internal static async Task<DispatchResult> DispatchKimiWebAsync(
         DispatchRequest request, Options options, CancellationToken token)
     {
-        if (string.IsNullOrWhiteSpace(request.SessionId))
+        if (!IsSafeSessionId(request.SessionId))
         {
             return new DispatchResult(false,
-                "no active Kimi Web session ID (pass --session <id> or enable Kimi hooks with --record-session)");
+                "invalid or missing Kimi Web session ID (pass --session <id> or enable Kimi hooks with --record-session)");
         }
 
-        var baseUrl = ResolveKimiWebBaseUrl(options);
+        var rawUrl = ResolveKimiWebBaseUrl(options);
+        var (baseUrl, urlErr) = ValidateLoopbackUrl(rawUrl);
+        if (baseUrl is null)
+            return new DispatchResult(false, urlErr!);
+
         var bearer = ResolveKimiWebToken(options);
 
-        var endpoint = $"{baseUrl.TrimEnd('/')}/api/v1/sessions/{Uri.EscapeDataString(request.SessionId)}/prompts";
+        var endpoint = $"{baseUrl}/api/v1/sessions/{Uri.EscapeDataString(request.SessionId)}/prompts";
         var payload = JsonSerializer.Serialize(new
         {
             content = new[] { new { type = "text", text = request.Message } },
@@ -480,17 +573,19 @@ public static class ClientBridge
     internal static async Task<DispatchResult> DispatchOpenCodeAsync(
         DispatchRequest request, Options options, CancellationToken token)
     {
-        if (string.IsNullOrWhiteSpace(request.SessionId))
+        if (!IsSafeSessionId(request.SessionId))
         {
             return new DispatchResult(false,
-                "no active OpenCode session ID (prefer the native plugins/opencode-agora-notify plugin, or pass --session)");
+                "invalid or missing OpenCode session ID (prefer the native plugins/opencode-agora-notify plugin, or pass --session)");
         }
 
-        // Default to direct HTTP against opencode service (avoids Windows opencode.cmd
-        // batch-wrapper injection & newline truncation altogether).
-        var baseUrl = string.IsNullOrWhiteSpace(options.ServerUrl)
+        var rawUrl = string.IsNullOrWhiteSpace(options.ServerUrl)
             ? DefaultOpenCodeUrl
-            : options.ServerUrl.Trim().TrimEnd('/');
+            : options.ServerUrl.Trim();
+        var (baseUrl, urlErr) = ValidateLoopbackUrl(rawUrl);
+        if (baseUrl is null)
+            return new DispatchResult(false, urlErr!);
+
         var password = ResolveOpenCodeServicePassword(options);
 
         var jsonBody = JsonSerializer.Serialize(new
@@ -558,10 +653,29 @@ public static class ClientBridge
         return DefaultKimiWebUrl;
     }
 
-    public static string? ResolveKimiWebToken(Options options)
+    private static string? ReadExplicitToken(Options options)
     {
+        if (!string.IsNullOrWhiteSpace(options.AuthTokenFile))
+        {
+            try
+            {
+                if (File.Exists(options.AuthTokenFile))
+                {
+                    var t = File.ReadAllText(options.AuthTokenFile, Encoding.UTF8).Trim();
+                    if (t.Length > 0) return t;
+                }
+            }
+            catch { }
+        }
         if (!string.IsNullOrWhiteSpace(options.AuthToken))
             return options.AuthToken.Trim();
+        return null;
+    }
+
+    public static string? ResolveKimiWebToken(Options options)
+    {
+        var explicitTok = ReadExplicitToken(options);
+        if (explicitTok is not null) return explicitTok;
 
         var envToken = Environment.GetEnvironmentVariable("KIMI_SERVER_TOKEN");
         if (!string.IsNullOrWhiteSpace(envToken))
@@ -582,8 +696,8 @@ public static class ClientBridge
 
     public static string? ResolveOpenCodeServicePassword(Options options)
     {
-        if (!string.IsNullOrWhiteSpace(options.AuthToken))
-            return options.AuthToken.Trim();
+        var explicitTok = ReadExplicitToken(options);
+        if (explicitTok is not null) return explicitTok;
 
         var envPass = Environment.GetEnvironmentVariable("OPENCODE_SERVER_PASSWORD");
         if (!string.IsNullOrWhiteSpace(envPass))
@@ -659,7 +773,8 @@ public static class ClientBridge
         TimeSpan window,
         TimeSpan cooldown,
         TextWriter err,
-        string client)
+        string client,
+        string agent)
     {
         if (maxWakes <= 0) return events;
         var now = DateTime.UtcNow;
@@ -683,6 +798,7 @@ public static class ClientBridge
                     err.WriteLine(
                         $"bridge [{client}]: wake cap cooldown active ({remMin}m left) for thread #{ev.ThreadId}; leaving msg #{ev.MsgId} in pending queries.");
                     err.Flush();
+                    NotifyLog.Write($"bridge:{client}", agent, $"thread #{ev.ThreadId} cooldown active ({remMin}m left)", ev.Seq, ev.TurnSeq);
                     checkedThreads[ev.ThreadId] = false;
                     continue;
                 }
@@ -699,6 +815,7 @@ public static class ClientBridge
                     err.WriteLine(
                         $"bridge [{client}]: wake cap ({maxWakes}/{window.TotalMinutes:0.#}m) tripped for thread #{ev.ThreadId}; latched for {cooldown.TotalMinutes:0}m, leaving msg #{ev.MsgId} in pending queries.");
                     err.Flush();
+                    NotifyLog.Write($"bridge:{client}", agent, $"thread #{ev.ThreadId} wake cap tripped", ev.Seq, ev.TurnSeq);
                     checkedThreads[ev.ThreadId] = false;
                     continue;
                 }
@@ -714,13 +831,28 @@ public static class ClientBridge
         List<BoardEvent> delivered,
         Dictionary<long, Queue<DateTime>> history,
         Dictionary<long, DateTime> latchedUntil,
+        Queue<DateTime> globalHistory,
+        ref DateTime? globalLatchedUntil,
         int maxWakes,
+        int maxGlobalWakes,
         TimeSpan window,
         TimeSpan cooldown)
     {
-        if (maxWakes <= 0) return;
         var now = DateTime.UtcNow;
         var cutoff = now - window;
+
+        if (maxGlobalWakes > 0)
+        {
+            while (globalHistory.Count > 0 && globalHistory.Peek() < cutoff) globalHistory.Dequeue();
+            globalHistory.Enqueue(now);
+            if (globalHistory.Count >= maxGlobalWakes)
+            {
+                globalLatchedUntil = now + cooldown;
+                globalHistory.Clear();
+            }
+        }
+
+        if (maxWakes <= 0) return;
         foreach (var tid in delivered.Select(e => e.ThreadId).Distinct())
         {
             if (!history.TryGetValue(tid, out var q))
@@ -732,7 +864,6 @@ public static class ClientBridge
             q.Enqueue(now);
             if (q.Count >= maxWakes)
             {
-                // Latch immediately once the Nth wake lands so the (N+1)th hits cooldown cleanly.
                 latchedUntil[tid] = now + cooldown;
                 q.Clear();
             }

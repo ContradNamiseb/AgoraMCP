@@ -218,4 +218,48 @@ public sealed class NotifyHubTests
         Assert.False(string.IsNullOrEmpty(meta.GetProperty("thread_id").GetString()));
         Assert.False(string.IsNullOrEmpty(meta.GetProperty("msg_id").GetString()));
     }
+
+    [Fact]
+    public async Task Hub_M3_RejectsNonLoopbackHostAndOriginWith403()
+    {
+        const int port = 48798;
+        using var temp = new TempDb();
+        ThreadStore.PostQuestion(temp.Open(), "seed", "", "alice");
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var hub = NotifyHub.RunAsync(
+            new NotifyHub.Options { DbPath = temp.DbPath, Port = port },
+            cts.Token);
+        await Task.Delay(400, cts.Token);
+
+        static async Task<string> SendRawRequestAsync(int p, string raw, CancellationToken token)
+        {
+            using var tcp = new System.Net.Sockets.TcpClient();
+            await tcp.ConnectAsync(System.Net.IPAddress.Loopback, p, token);
+            using var stream = tcp.GetStream();
+            var bytes = System.Text.Encoding.ASCII.GetBytes(raw);
+            await stream.WriteAsync(bytes, token);
+            await stream.FlushAsync(token);
+            using var reader = new StreamReader(stream, System.Text.Encoding.ASCII);
+            return await reader.ReadLineAsync(token) ?? "";
+        }
+
+        // DNS rebinding Host header -> 403 Forbidden.
+        var badHost = await SendRawRequestAsync(port,
+            "GET /events?since=0 HTTP/1.1\r\nHost: evil.rebind.example:48798\r\n\r\n", cts.Token);
+        Assert.Contains("403", badHost);
+
+        // Cross-origin browser EventSource -> 403 Forbidden.
+        var badOrigin = await SendRawRequestAsync(port,
+            $"GET /events?since=0 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: https://evil.example\r\n\r\n", cts.Token);
+        Assert.Contains("403", badOrigin);
+
+        // Loopback Host with no Origin -> 200 OK.
+        var ok = await SendRawRequestAsync(port,
+            $"GET /events?since=0 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n", cts.Token);
+        Assert.Contains("200", ok);
+
+        cts.Cancel();
+        await hub;
+    }
 }

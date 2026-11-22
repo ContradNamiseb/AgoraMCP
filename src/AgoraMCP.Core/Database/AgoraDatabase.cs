@@ -60,11 +60,11 @@ public static class AgoraDatabase
         db.Execute("PRAGMA busy_timeout = 5000");
         db.Execute("PRAGMA foreign_keys = ON");
         db.Execute("PRAGMA synchronous = NORMAL");
-        db.Execute(SchemaSql);
 
-        // Schema.sql only ever creates what is missing, so an existing database
-        // would otherwise stay on whatever shape it was first created with.
-        Migrations.Apply(db);
+        // Fast path (S3): skip Schema.sql + migration DDL once user_version is
+        // already current (saves ~15 DDL parses on every hook-check / tool open).
+        if (db.Scalar<long>("PRAGMA user_version") < Migrations.CurrentVersion)
+            Migrations.Apply(db);
         return db;
     }
 

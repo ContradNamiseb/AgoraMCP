@@ -50,6 +50,7 @@ internal static class Program
                 "tail" => TailCmd(args),
                 "hook-check" => HookCheckCmd(args),
                 "bridge" => BridgeCmd(args),
+                "doctor" => Notify.Doctor.Run(Option(args, "--db") is { Length: > 0 } ddb ? ddb : Config.ResolveDbPath()),
                 "help" or "--help" or "-h" => Help(0),
                 var unknown => Fail($"unknown command '{unknown}'"),
             };
@@ -148,6 +149,7 @@ internal static class Program
             ParentPid = parentPid,
             ExitWithParent = args.Contains("--exit-with-parent"),
             ExitOnStdinEof = args.Contains("--exit-on-stdin-eof"),
+            EmitReady = args.Contains("--emit-ready"),
         }, stdout: null, token: cts.Token).GetAwaiter().GetResult();
     }
 
@@ -187,6 +189,7 @@ internal static class Program
         if (!TryParseOptionalDouble(args, "--timeout", "bridge", out var timeout)) return 2;
         if (!TryParseOptionalDouble(args, "--interval", "bridge", out var interval)) return 2;
         if (!TryParseOptionalInt(args, "--max-wakes", "bridge", out var maxWakes)) return 2;
+        if (!TryParseOptionalInt(args, "--max-global-wakes", "bridge", out var maxGlobalWakes)) return 2;
         if (!TryParseOptionalInt(args, "--parent-pid", "bridge", out var parentPid)) return 2;
         if (!TryParseOptionalNonNegativeDouble(args, "--session-max-age-sec", "bridge", out var sessionMaxAge)) return 2;
 
@@ -202,6 +205,7 @@ internal static class Program
             SessionMaxAgeSeconds = sessionMaxAge ?? Notify.ClientBridge.DefaultSessionMaxAgeSeconds,
             ServerUrl = Option(args, "--url"),
             AuthToken = Option(args, "--token"),
+            AuthTokenFile = Option(args, "--token-file"),
             ExecutablePath = Option(args, "--exe"),
             Since = since,
             SinceTurn = sinceTurn,
@@ -212,6 +216,7 @@ internal static class Program
             TimeoutSeconds = timeout,
             IntervalSeconds = interval ?? (NamedBoardEvent.IsSupported ? 5 : 1),
             MaxWakesPerThread = maxWakes ?? 6,
+            MaxGlobalWakes = maxGlobalWakes ?? Notify.ClientBridge.DefaultMaxGlobalWakes,
             ParentPid = parentPid,
             ExitWithParent = args.Contains("--exit-with-parent"),
             ExitOnStdinEof = args.Contains("--exit-on-stdin-eof"),

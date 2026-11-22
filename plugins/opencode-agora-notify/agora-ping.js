@@ -1,20 +1,10 @@
 // Agora automatic push notification plugin for OpenCode v2.
 //
 // Hub-less by default: spawns `agora tail --agent <name> --parent-pid <pid>
-// --exit-on-stdin-eof` (0% CPU Windows NamedBoardEvent wait, zero separate
-// `agora hub` daemon needed), tracks active session ID and busy/idle state,
-// and injects nonce-delimited peer DMs, directed board posts, and turn passes
-// via `ctx.session.prompt(...)` once the session is idle.
-//
-// Install: copy into `~/.config/opencode/plugins/agora-ping.js` (or project
-// `.opencode/plugins/agora-ping.js`).
-//
-// Optional environment variables:
-//   AGORA_EXE                   path to agora binary (default: repo publish/agora[.exe] or "agora")
-//   AGORA_AGENT                 agent identity on the board (default "opencode")
-//   AGORA_DB                    explicit SQLite db path (default %LOCALAPPDATA%\AgoraMCP\agora.db)
-//   AGORA_MAX_WAKES_PER_THREAD  per-thread cap before 60m latch (default 6, 0 = unlimited)
-//   AGORA_PING                  set to "0" to disable
+// --exit-on-stdin-eof --emit-ready` (0% CPU Windows NamedBoardEvent wait, zero
+// separate `agora hub` daemon needed), tracks active session ID and busy/idle
+// state, and injects 128-bit nonce-delimited peer DMs, directed board posts,
+// and turn passes via `ctx.session.prompt(...)` once the session is idle.
 
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -24,8 +14,10 @@ import { fileURLToPath } from "node:url";
 import { Plugin } from "@opencode/plugin";
 
 const MAX_BODY_CHARS = 3000;
+const MAX_TOPIC_CHARS = 80;
 const WAKE_WINDOW_MS = 10 * 60 * 1000;
 const WAKE_COOLDOWN_MS = 60 * 60 * 1000;
+const STABLE_UPTIME_MS = 10 * 1000;
 
 function parseNonNegativeInt(raw, fallback) {
   if (raw === undefined || raw === null || String(raw).trim() === "") return fallback;
@@ -49,22 +41,25 @@ function sanitizeIdentifier(value, fallback) {
 
 function sanitizeInline(value, fallback) {
   const cleaned = String(value || "")
-    .replace(/[\r\n]+/g, " ")
+    .replace(/\p{Cf}/gu, "")
+    .replace(/[\p{Cc}\p{Zl}\p{Zp}\s]+/gu, " ")
     .replace(/"/g, "'")
     .trim();
-  return cleaned.length > 0 ? cleaned : fallback;
+  if (cleaned.length === 0) return fallback;
+  return cleaned.length <= MAX_TOPIC_CHARS ? cleaned : safeTruncate(cleaned, MAX_TOPIC_CHARS - 1) + "…";
 }
 
 function neutralizePeerBody(body) {
   const normalized = String(body || "")
     .replace(/\r\n/g, "\n")
-    .replace(/\r/g, "\n")
+    .replace(/\p{Cf}/gu, "")
+    .replace(/[\r\v\f\u0085\p{Zl}\p{Zp}]/gu, "\n")
     .replace(/<<<AGORA_PEER_MESSAGE/gi, "[agora-peer-marker-escaped]")
     .replace(/<<<END_AGORA_PEER_MESSAGE/gi, "[agora-peer-end-escaped]");
 
   return normalized
     .split("\n")
-    .map((line) => (/^\[Agora\s/i.test(line.trimStart()) ? "> " + line : line))
+    .map((line) => (/^\[Agora[\s\t]/i.test(line.trimStart()) ? "> " + line : line))
     .join("\n");
 }
 
@@ -93,7 +88,7 @@ function formatEventPrompt(ev) {
       safeTruncate(rawBody, MAX_BODY_CHARS) +
       `\n\n[truncated — call thread_briefing/read_thread on #${ev.thread} for full message]`;
   }
-  const nonce = randomBytes(4).toString("hex");
+  const nonce = randomBytes(16).toString("hex");
   const openTag = `<<<AGORA_PEER_MESSAGE:${nonce}>>>`;
   const closeTag = `<<<END_AGORA_PEER_MESSAGE:${nonce}>>>`;
   const safeBody = neutralizePeerBody(rawBody);
@@ -123,6 +118,7 @@ export default Plugin.define({
     const agoraExe = resolveDefaultAgoraExe();
     const dbPath = (process.env.AGORA_DB || "").trim();
     const maxWakesPerThread = parseNonNegativeInt(process.env.AGORA_MAX_WAKES_PER_THREAD, 6);
+    const maxGlobalWakes = parseNonNegativeInt(process.env.AGORA_MAX_GLOBAL_WAKES, 15);
 
     if (!agent || process.env.AGORA_PING === "0") return;
 
@@ -134,6 +130,8 @@ export default Plugin.define({
     let backoffMs = 2000;
     let lastMsgSeq = 0;
     let lastTurnSeq = 0;
+    let hasCursor = false;
+    let consecutiveUsageErrors = 0;
     let hookRegistration = null;
     let flushing = false;
     let injectingCount = 0;
@@ -141,6 +139,8 @@ export default Plugin.define({
     const pendingItems = [];
     const wakeHistory = new Map();
     const latchedUntil = new Map();
+    let globalWakeHistory = [];
+    let globalLatchedUntil = 0;
     const controller = new AbortController();
 
     const log = (level, message, extra) => {
@@ -154,15 +154,29 @@ export default Plugin.define({
     };
 
     const allowWakeForThread = (threadId) => {
+      const now = Date.now();
+      const cutoff = now - WAKE_WINDOW_MS;
+
+      if (maxGlobalWakes > 0) {
+        if (globalLatchedUntil > 0) {
+          if (now < globalLatchedUntil) return false;
+          globalLatchedUntil = 0;
+        }
+        globalWakeHistory = globalWakeHistory.filter((ts) => ts >= cutoff);
+        if (globalWakeHistory.length >= maxGlobalWakes) {
+          globalLatchedUntil = now + WAKE_COOLDOWN_MS;
+          globalWakeHistory = [];
+          return false;
+        }
+      }
+
       if (maxWakesPerThread <= 0) return true;
       const key = String(threadId ?? 0);
-      const now = Date.now();
       const until = latchedUntil.get(key);
       if (until !== undefined) {
         if (now < until) return false;
         latchedUntil.delete(key);
       }
-      const cutoff = now - WAKE_WINDOW_MS;
       const list = (wakeHistory.get(key) || []).filter((ts) => ts >= cutoff);
       if (list.length >= maxWakesPerThread) {
         latchedUntil.set(key, now + WAKE_COOLDOWN_MS);
@@ -173,10 +187,20 @@ export default Plugin.define({
     };
 
     const recordSuccessfulWake = (threadId) => {
-      if (maxWakesPerThread <= 0) return;
-      const key = String(threadId ?? 0);
       const now = Date.now();
       const cutoff = now - WAKE_WINDOW_MS;
+
+      if (maxGlobalWakes > 0) {
+        globalWakeHistory = globalWakeHistory.filter((ts) => ts >= cutoff);
+        globalWakeHistory.push(now);
+        if (globalWakeHistory.length >= maxGlobalWakes) {
+          globalLatchedUntil = now + WAKE_COOLDOWN_MS;
+          globalWakeHistory = [];
+        }
+      }
+
+      if (maxWakesPerThread <= 0) return;
+      const key = String(threadId ?? 0);
       const list = (wakeHistory.get(key) || []).filter((ts) => ts >= cutoff);
       list.push(now);
       if (list.length >= maxWakesPerThread) {
@@ -211,7 +235,7 @@ export default Plugin.define({
 
     const enqueueWake = (ev) => {
       if (!allowWakeForThread(ev.thread)) {
-        log("warn", `auto-wake cap (${maxWakesPerThread}/10m, 60m latch) active for thread #${ev.thread}; leaving in pending queries.`);
+        log("warn", `auto-wake cap (${maxWakesPerThread}/thread, ${maxGlobalWakes}/global, 60m latch) active for thread #${ev.thread}; leaving in pending queries.`);
         return;
       }
       if (!sessionId) {
@@ -226,7 +250,6 @@ export default Plugin.define({
       void flushPending();
     };
 
-    // Learn active session ID from prompt hook and reset latched loop breakers on human prompts.
     try {
       if (typeof ctx.session?.hook === "function") {
         hookRegistration = await ctx.session.hook("prompt", (event) => {
@@ -236,6 +259,8 @@ export default Plugin.define({
           if (injectingCount === 0) {
             wakeHistory.clear();
             latchedUntil.clear();
+            globalWakeHistory = [];
+            globalLatchedUntil = 0;
           }
         });
       }
@@ -274,6 +299,7 @@ export default Plugin.define({
 
     const startTail = () => {
       if (stopping) return;
+      const startedAt = Date.now();
       const argv = [
         "tail",
         "--agent",
@@ -281,10 +307,13 @@ export default Plugin.define({
         "--parent-pid",
         String(process.pid),
         "--exit-on-stdin-eof",
+        "--emit-ready",
       ];
       if (dbPath.length > 0) argv.push("--db", dbPath);
-      if (lastMsgSeq > 0) argv.push("--since", String(lastMsgSeq));
-      if (lastTurnSeq > 0) argv.push("--since-turn", String(lastTurnSeq));
+      if (hasCursor) {
+        argv.push("--since", String(lastMsgSeq));
+        argv.push("--since-turn", String(lastTurnSeq));
+      }
 
       let proc;
       try {
@@ -302,7 +331,6 @@ export default Plugin.define({
       let buffer = "";
       proc.stdout.setEncoding("utf-8");
       proc.stdout.on("data", (chunk) => {
-        backoffMs = 2000;
         buffer += chunk;
         let nl = buffer.indexOf("\n");
         while (nl >= 0) {
@@ -316,10 +344,17 @@ export default Plugin.define({
           } catch {
             continue;
           }
+          if (ev.kind === "ready") {
+            if (typeof ev.seq === "number" && ev.seq >= lastMsgSeq) lastMsgSeq = ev.seq;
+            if (typeof ev.turn_seq === "number" && ev.turn_seq >= lastTurnSeq) lastTurnSeq = ev.turn_seq;
+            hasCursor = true;
+            continue;
+          }
+          enqueueWake(ev);
           if (typeof ev.msg === "number" && ev.msg > lastMsgSeq) lastMsgSeq = ev.msg;
           else if (typeof ev.seq === "number" && ev.seq > lastMsgSeq) lastMsgSeq = ev.seq;
           if (typeof ev.turn_seq === "number" && ev.turn_seq > lastTurnSeq) lastTurnSeq = ev.turn_seq;
-          enqueueWake(ev);
+          hasCursor = true;
         }
       });
 
@@ -336,6 +371,18 @@ export default Plugin.define({
       proc.on("exit", (code, signal) => {
         if (child === proc) child = null;
         if (stopping) return;
+        if (code === 2) {
+          consecutiveUsageErrors += 1;
+          if (consecutiveUsageErrors >= 3) {
+            log("warn", "agora tail exited with code 2 three times (possible version skew); stopping auto-restart.");
+            return;
+          }
+        } else {
+          consecutiveUsageErrors = 0;
+        }
+        if (Date.now() - startedAt >= STABLE_UPTIME_MS) {
+          backoffMs = 2000;
+        }
         log("warn", `agora tail exited (code=${code}, signal=${signal}); restarting in ${backoffMs}ms`);
         scheduleRestart();
       });
