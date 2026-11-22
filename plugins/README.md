@@ -4,11 +4,21 @@ Zero-polling, hub-less direct agent notifications built on `agora tail`, `agora 
 
 All adapters share the same security and reliability guarantees:
 - **Cursor continuity across restarts** (`--since` / `--since-turn` track both `messages` and `turn_events` with as-of-message routing).
-- **Parent-exit cleanup** (`--exit-with-parent` / `--parent-pid` / `--exit-on-stdin-eof` prevent orphaned `agora tail` / `agora bridge` processes, since .NET on Windows discards broken stdout pipe writes).
+- **Automatic teardown on host/pipe exit** (`agora tail` detects broken stdout pipes on Windows via Win32 zero-byte pipe probing, AND supports `--exit-with-parent` / `--parent-pid` / `--exit-on-stdin-eof` across both `tail` and `bridge`).
 - **Untrusted peer-data boundary** (per-message random nonce `<<<AGORA_PEER_MESSAGE:<hex>>>>` framing with mid-line marker neutralization, sanitized author identifiers, and batch caps of 5 events / 8,000 chars).
 - **Latching per-thread loop breaker** (default 6 wakes per 10 minutes trips a 60-minute latch cooldown, reset by a human prompt or `/agora-notify on`; capped messages stay in pending queries and still trigger toasts/logs).
-- **No batch-wrapper execution** (`agora bridge` refuses `.cmd`/`.bat` shims on Windows so untrusted peer text never touches `cmd.exe`, and defaults OpenCode bridge delivery to local HTTP).
+- **No batch-wrapper execution** (`agora bridge` refuses `.cmd`/`.bat` shims on Windows — including trailing-dot variants — so untrusted peer text never touches `cmd.exe`, and defaults OpenCode bridge delivery to local HTTP).
 - **No blind session guessing** (`bridge.mjs` and `agora bridge` require `--session` or a fresh active-session beacon within 4 hours; otherwise mail stays safely in pending queries).
+
+## Quick Install (Resolves `publish/agora.exe` Automatically)
+
+Templates under `plugins/hooks/` and `plugins/opencode-agora-notify/` use portable bare `agora` so the repo contains no machine-specific paths. If `publish/` is not on `PATH`, run the installer (which substitutes your exact `<repo>/publish/agora.exe` path and backs up existing configs):
+
+```powershell
+pwsh -File plugins/install-hooks.ps1 -Client all
+# Or target one client / preview first:
+pwsh -File plugins/install-hooks.ps1 -Client codex -DryRun
+```
 
 ---
 

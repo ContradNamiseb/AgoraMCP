@@ -111,12 +111,16 @@ public static partial class BoardTail
                 : (DateTime?)null;
             var fallback = TimeSpan.FromSeconds(Math.Clamp(options.IntervalSeconds, 0.1, 60));
 
+            var checkStdoutPipe = stdout is null && OperatingSystem.IsWindows() && Console.IsOutputRedirected;
+
             var firstPass = true;
             while (!linkedToken.IsCancellationRequested)
             {
                 if (!firstPass)
                 {
                     if (watchedParent is not null && SafeHasExited(watchedParent))
+                        return 0;
+                    if (checkStdoutPipe && IsWindowsStdoutPipeBroken())
                         return 0;
 
                     var wait = fallback;
@@ -139,6 +143,8 @@ public static partial class BoardTail
 
                 if (watchedParent is not null && SafeHasExited(watchedParent))
                     return 0;
+                if (checkStdoutPipe && IsWindowsStdoutPipeBroken())
+                    return 0;
 
                 try
                 {
@@ -157,8 +163,12 @@ public static partial class BoardTail
                     if (events.Count > 0)
                     {
                         foreach (var ev in events)
+                        {
                             output.WriteLine(JsonSerializer.Serialize(ev));
-                        output.Flush();
+                            output.Flush();
+                            if (checkStdoutPipe && IsWindowsStdoutPipeBroken())
+                                return 0;
+                        }
                         if (options.Once) return 0;
                     }
                 }
@@ -347,6 +357,43 @@ public static partial class BoardTail
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
         public string szExeFile;
     }
+
+    /// <summary>
+    /// Detects a closed stdout pipe on Windows (L12). .NET's ConsoleStream
+    /// intentionally swallows ERROR_BROKEN_PIPE (109) / ERROR_NO_DATA (232) on
+    /// Console.Out writes, so a zero-byte WriteFile probe against STD_OUTPUT_HANDLE
+    /// lets tail exit cleanly as soon as the reader closes its end of the pipe.
+    /// </summary>
+    internal static bool IsWindowsStdoutPipeBroken()
+    {
+        if (!OperatingSystem.IsWindows()) return false;
+        const int stdOutputHandle = -11;
+        const uint fileTypePipe = 0x0003;
+        const int errorBrokenPipe = 109;
+        const int errorNoData = 232;
+
+        var h = GetStdHandle(stdOutputHandle);
+        if (h == IntPtr.Zero || h == new IntPtr(-1)) return false;
+        if (GetFileType(h) != fileTypePipe) return false;
+
+        byte dummy = 0;
+        if (WriteFile(h, ref dummy, 0, out _, IntPtr.Zero))
+            return false;
+
+        var err = Marshal.GetLastWin32Error();
+        return err is errorBrokenPipe or errorNoData;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GetStdHandle(int nStdHandle);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint GetFileType(IntPtr hFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool WriteFile(
+        IntPtr hFile, ref byte lpBuffer, uint nNumberOfBytesToWrite,
+        out uint lpNumberOfBytesWritten, IntPtr lpOverlapped);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern IntPtr CreateToolhelp32Snapshot(uint dwFlags, uint th32ProcessID);

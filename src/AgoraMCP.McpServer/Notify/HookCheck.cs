@@ -38,6 +38,8 @@ public static class HookCheck
         public string EventName { get; init; } = "auto";
         /// <summary>Explicit cursor &amp; stop-loop-guard file path (overrides per-session default).</summary>
         public string? StatePath { get; init; }
+        /// <summary>Optional directory for per-session default state files (defaults to %LOCALAPPDATA%\AgoraMCP\hooks).</summary>
+        public string? StateDir { get; init; }
         /// <summary>If true, record top-level session/thread ID from stdin JSON for `agora bridge`.</summary>
         public bool RecordSession { get; init; }
         /// <summary>Target beacon file when <see cref="RecordSession"/> is true.</summary>
@@ -69,12 +71,14 @@ public static class HookCheck
         [property: JsonPropertyName("cwd")] string Cwd,
         [property: JsonPropertyName("updated_at")] string UpdatedAt);
 
-    public static string DefaultStatePath(string agent, string? sessionId = null)
+    public static string DefaultStatePath(string agent, string? sessionId = null, string? stateDir = null)
     {
-        var dir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "AgoraMCP",
-            "hooks");
+        var dir = string.IsNullOrWhiteSpace(stateDir)
+            ? Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "AgoraMCP",
+                "hooks")
+            : stateDir!;
         var slug = SanitizeFileSegment(agent);
         if (!string.IsNullOrWhiteSpace(sessionId))
         {
@@ -143,7 +147,7 @@ public static class HookCheck
                 return 0;
 
             var statePath = string.IsNullOrWhiteSpace(options.StatePath)
-                ? DefaultStatePath(agent, payload.IsSubagent ? null : payload.SessionId)
+                ? DefaultStatePath(agent, payload.IsSubagent ? null : payload.SessionId, options.StateDir)
                 : options.StatePath!;
 
             using var stateLock = AcquireStateLock(statePath);

@@ -262,6 +262,35 @@ public sealed class HookAndBridgeTests
             Assert.Equal(0, rc);
             // Cursor stayed at beforeId because emit threw before save!
             Assert.Equal(beforeId, HookCheck.LoadState(statePath)!.LastMsgId);
+
+            // Finding R5: a brand-new session inherits the agent's most recent session cursor
+            // (within 24h) so mail arriving while no session was open still surfaces on session start.
+            var stateDir = Path.Combine(dir, "session-states");
+            var seedOut = new StringWriter();
+            Assert.Equal(0, HookCheck.Run(new HookCheck.Options
+            {
+                DbPath = dbPath,
+                Agent = "codex",
+                Format = "codex",
+                StateDir = stateDir,
+            }, new StringReader("""{"session_id":"sess-old","hook_event_name":"SessionStart"}"""), seedOut, new StringWriter()));
+            Assert.Equal("", seedOut.ToString());
+
+            using (var db = AgoraDatabase.Open(dbPath))
+                DmStore.Send(db, "antigravity", "codex", "arrived while no codex session was open");
+
+            var newSessOut = new StringWriter();
+            Assert.Equal(0, HookCheck.Run(new HookCheck.Options
+            {
+                DbPath = dbPath,
+                Agent = "codex",
+                Format = "codex",
+                StateDir = stateDir,
+            }, new StringReader("""{"session_id":"sess-new","hook_event_name":"SessionStart"}"""), newSessOut, new StringWriter()));
+            Assert.Contains("arrived while no codex session was open", newSessOut.ToString());
+            // Both sessions keep distinct cursor files.
+            Assert.True(File.Exists(HookCheck.DefaultStatePath("codex", "sess-old", stateDir)));
+            Assert.True(File.Exists(HookCheck.DefaultStatePath("codex", "sess-new", stateDir)));
         }
         finally
         {
@@ -763,6 +792,65 @@ public sealed class HookAndBridgeTests
             }, new StringWriter(), CancellationToken.None, (_, _) => throw new HttpRequestException("actively refused"));
 
             Assert.Equal(1, rcOnce);
+        }
+        finally
+        {
+            CleanupDir(dir);
+        }
+    }
+
+    [Fact]
+    public void BoardTail_ExitsCleanly_WhenStdoutPipeClosesOnWindows()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        var dir = TempDir();
+        try
+        {
+            var dbPath = Path.Combine(dir, "agora.db");
+            using (var db = AgoraDatabase.Open(dbPath))
+                DmStore.Send(db, "antigravity", "pipe-probe", "seed");
+
+            // Finding L12: spawn real agora.exe tail with NO lifecycle flags,
+            // close its stdout pipe, post a DM + Broadcast, and verify it exits cleanly!
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = BuiltApphost.Path,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            psi.ArgumentList.Add("tail");
+            psi.ArgumentList.Add("--agent");
+            psi.ArgumentList.Add("pipe-probe");
+            psi.ArgumentList.Add("--db");
+            psi.ArgumentList.Add(dbPath);
+            psi.ArgumentList.Add("--interval");
+            psi.ArgumentList.Add("0.2");
+            psi.ArgumentList.Add("--timeout");
+            psi.ArgumentList.Add("15");
+
+            using var proc = System.Diagnostics.Process.Start(psi)!;
+            try
+            {
+                Thread.Sleep(300);
+                // Close our read end of stdout so the pipe breaks.
+                proc.StandardOutput.Close();
+                using (var db = AgoraDatabase.Open(dbPath))
+                    DmStore.Send(db, "antigravity", "pipe-probe", "wake into closed pipe");
+                NamedBoardEvent.Broadcast(dbPath);
+
+                var exited = proc.WaitForExit(5000);
+                Assert.True(exited, "agora tail stayed alive after stdout pipe closed!");
+                Assert.Equal(0, proc.ExitCode);
+            }
+            finally
+            {
+                if (!proc.HasExited)
+                {
+                    try { proc.Kill(entireProcessTree: true); } catch { }
+                }
+            }
         }
         finally
         {
