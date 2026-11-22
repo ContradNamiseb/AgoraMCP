@@ -272,8 +272,9 @@ public static class ClientBridge
                 }
                 catch (Exception e) when (e is not OperationCanceledException)
                 {
-                    err.WriteLine($"bridge [{client}]: error ({e.Message}) — continuing.");
+                    err.WriteLine($"bridge [{client}]: error ({e.Message}) — {(options.Once ? "aborting (--once)." : "continuing.")}");
                     err.Flush();
+                    if (options.Once) return 1;
                 }
 
                 if (deadline is { } dlAfter && DateTime.UtcNow >= dlAfter)
@@ -357,7 +358,10 @@ public static class ClientBridge
         if (exe.Length == 0)
             return (null, "executable path is empty");
 
-        var ext = Path.GetExtension(exe);
+        // Windows strips trailing dots and spaces when opening files (e.g. "codex.cmd."),
+        // so normalize before checking extension (R6).
+        var normalizedForExt = exe.TrimEnd('.', ' ');
+        var ext = Path.GetExtension(normalizedForExt);
         if (ext.Equals(".cmd", StringComparison.OrdinalIgnoreCase) ||
             ext.Equals(".bat", StringComparison.OrdinalIgnoreCase))
         {

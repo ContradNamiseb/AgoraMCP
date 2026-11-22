@@ -332,10 +332,11 @@ public static class NotifyHub
         bool dmsOnly = false,
         bool excludeSelf = false)
     {
-        // Single WAL read snapshot across both messages and turn_events so a
-        // concurrent respond() commit can never split between the two queries.
+        // Single WAL read snapshot across both messages and turn_events using
+        // BEGIN DEFERRED (never BEGIN IMMEDIATE, which takes the SQLite write lock
+        // and would block readers against writers and each other).
         using var db = AgoraDatabase.Open(dbPath);
-        using var tx = db.BeginTransaction();
+        using var tx = db.BeginTransaction(deferred: true);
 
         var (msgEvents, maxMsg) = ReadEventsSinceCore(
             db, sinceMsgId, agent, directedOnly, dmsOnly, excludeSelf);
@@ -516,8 +517,11 @@ public static class NotifyHub
             {
                 turnHolder = te.ToAgent;
                 turnFrom = te.FromAgent;
-                if (te.CompanionMsgId == r.Seq && te.Instruction.Length > 0)
+                if (te.CompanionMsgId == r.Seq && te.Instruction.Length > 0 &&
+                    !string.Equals(te.Instruction, $"act on message #{r.Seq}", StringComparison.OrdinalIgnoreCase))
+                {
                     companionInstruction = FormatTurnPassNote(te.ToRole, te.Stage, te.Instruction);
+                }
             }
 
             var effectiveTo = EffectiveRecipient(

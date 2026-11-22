@@ -151,21 +151,41 @@ public static class HookCheck
             var state = LoadState(statePath);
             if (state is null && options.Since is null)
             {
-                // First run for this session: seed cursors at current MAX(id) so
-                // hooks never spam historical threads from before session start.
-                var maxSeq = NotifyHub.ReadMaxSeq(dbPath);
-                var maxTurn = NotifyHub.ReadMaxTurnSeq(dbPath);
-                if (!options.NoAdvance)
+                // First run for this session: if another recent session of this agent
+                // already saved a cursor (within 24h), inherit it so mail arriving
+                // between sessions is still surfaced (R5); otherwise seed at MAX(id)
+                // so brand-new installs never spam ancient history.
+                var inherited = string.IsNullOrWhiteSpace(options.StatePath)
+                    ? TryLoadNewestAgentState(Path.GetDirectoryName(statePath), agent, TimeSpan.FromHours(24))
+                    : null;
+
+                if (inherited is not null)
                 {
-                    WriteJsonAtomic(statePath, new HookState
+                    state = new HookState
                     {
-                        LastMsgId = maxSeq,
-                        LastTurnId = maxTurn,
+                        LastMsgId = inherited.LastMsgId,
+                        LastTurnId = inherited.LastTurnId,
                         ConsecutiveBlocks = 0,
-                    });
-                    PruneStaleHookFiles(Path.GetDirectoryName(statePath));
+                    };
+                    if (!options.NoAdvance)
+                        PruneStaleHookFiles(Path.GetDirectoryName(statePath));
                 }
-                return 0;
+                else
+                {
+                    var maxSeq = NotifyHub.ReadMaxSeq(dbPath);
+                    var maxTurn = NotifyHub.ReadMaxTurnSeq(dbPath);
+                    if (!options.NoAdvance)
+                    {
+                        WriteJsonAtomic(statePath, new HookState
+                        {
+                            LastMsgId = maxSeq,
+                            LastTurnId = maxTurn,
+                            ConsecutiveBlocks = 0,
+                        });
+                        PruneStaleHookFiles(Path.GetDirectoryName(statePath));
+                    }
+                    return 0;
+                }
             }
 
             var effectiveState = state ?? new HookState
@@ -192,7 +212,7 @@ public static class HookCheck
 
             if (events.Count == 0)
             {
-                var changed = false;
+                var changed = !File.Exists(statePath);
                 // Only a new user prompt or session start resets the Stop loop counter
                 // (never another Stop event or automated PostToolUse).
                 if (isUserTurnBoundary && effectiveState.ConsecutiveBlocks > 0)
@@ -649,6 +669,29 @@ public static class HookCheck
             }
         }
         catch { }
+    }
+
+    internal static HookState? TryLoadNewestAgentState(string? dir, string agent, TimeSpan maxAge)
+    {
+        if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) return null;
+        try
+        {
+            var slug = SanitizeFileSegment(agent);
+            var cutoff = DateTime.UtcNow - maxAge;
+            var newest = new DirectoryInfo(dir)
+                .EnumerateFiles($"hook-{slug}*.json")
+                .Where(f =>
+                    (f.Name.Equals($"hook-{slug}.json", StringComparison.OrdinalIgnoreCase) ||
+                     f.Name.StartsWith($"hook-{slug}-", StringComparison.OrdinalIgnoreCase)) &&
+                    f.LastWriteTimeUtc >= cutoff)
+                .OrderByDescending(f => f.LastWriteTimeUtc)
+                .FirstOrDefault();
+            return newest is null ? null : LoadState(newest.FullName);
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     internal static HookState? LoadState(string path)

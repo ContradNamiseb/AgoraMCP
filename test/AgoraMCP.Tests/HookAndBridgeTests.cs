@@ -363,6 +363,11 @@ public sealed class HookAndBridgeTests
             Assert.False(res.Ok);
             Assert.Contains(".cmd/.bat", res.Detail);
             Assert.False(File.Exists(marker));
+
+            // Finding R6: trailing dots/spaces (e.g. "codex.cmd.") MUST ALSO be refused!
+            var (resolvedTrailing, errTrailing) = ClientBridge.ResolveSafeExecutable(fakeCmd + ". ");
+            Assert.Null(resolvedTrailing);
+            Assert.Contains(".cmd/.bat", errTrailing);
         }
         finally
         {
@@ -658,9 +663,10 @@ public sealed class HookAndBridgeTests
                 DmStore.Send(db, "antigravity", "codex", "msg 1");
 
             var attempts = 0;
-            var secondDelivered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             var firstAttempted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            var log = new StringWriter();
+            var secondDelivered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var cooldownLogged = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var log = new SignalStringWriter("cooldown active", cooldownLogged);
 
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
             var task = ClientBridge.RunAsync(new ClientBridge.Options
@@ -672,7 +678,7 @@ public sealed class HookAndBridgeTests
                 Since = 0,
                 MaxWakesPerThread = 1,
                 WakeCooldownSeconds = 3600,
-                TimeoutSeconds = 1.6,
+                TimeoutSeconds = 9,
                 IntervalSeconds = 0.2,
             }, log, cts.Token, (_, _) =>
             {
@@ -697,14 +703,80 @@ public sealed class HookAndBridgeTests
                 DmStore.Send(db, "antigravity", "codex", "msg 3 blocked by cooldown");
             NamedBoardEvent.Broadcast(dbPath);
 
+            // Deterministic shutdown once cooldown fires (no wall-clock race — Finding R2).
+            await cooldownLogged.Task.WaitAsync(TimeSpan.FromSeconds(5), cts.Token);
+            cts.Cancel();
+
             var rc = await task;
             Assert.Equal(0, rc);
-            Assert.Equal(2, attempts); // attempt 1 failed (not counted), attempt 2 succeeded (latched), msg 3 blocked!
+            Assert.Equal(2, attempts);
             Assert.Contains("cooldown active", log.ToString());
         }
         finally
         {
             CleanupDir(dir);
+        }
+    }
+
+    [Fact]
+    public async Task RegressionChecks_R1_DeferredReadUnderWriterLock_R3_OnceExitOnThrow_R4_NoPlaceholderAppend()
+    {
+        var dir = TempDir();
+        try
+        {
+            var dbPath = Path.Combine(dir, "agora.db");
+            long tid;
+            using (var db = AgoraDatabase.Open(dbPath))
+            {
+                tid = ThreadStore.PostQuestion(db, "lock-test", "body", "probe-a");
+                var m = ThreadStore.Reply(db, tid, "plain reply", "probe-a");
+                // Finding R4: auto-generated placeholder "act on message #N" must NOT be appended.
+                TurnStore.Pass(db, tid, "probe-a", "probe-b", $"act on message #{m.Id}", companionMsgId: m.Id);
+            }
+
+            // Finding R1: hold BEGIN IMMEDIATE write lock on another connection;
+            // ReadCombinedSince MUST complete immediately via WAL BEGIN DEFERRED without blocking!
+            using (var writer = AgoraDatabase.Open(dbPath))
+            using (var writeTx = writer.BeginTransaction()) // BEGIN IMMEDIATE in Microsoft.Data.Sqlite
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var (evs, _, _) = NotifyHub.ReadCombinedSince(dbPath, 0, 0, "probe-b", directedOnly: true, excludeSelf: true);
+                sw.Stop();
+
+                Assert.True(sw.Elapsed < TimeSpan.FromSeconds(2), $"Read blocked on writer lock ({sw.Elapsed})!");
+                var ev = Assert.Single(evs);
+                Assert.Equal("plain reply", ev.Body);
+                Assert.DoesNotContain("[turn passed]", ev.Body);
+                writeTx.Rollback();
+            }
+
+            // Finding R3: bridge --once MUST exit 1 when dispatch throws (not exit 0 after timeout).
+            var rcOnce = await ClientBridge.RunAsync(new ClientBridge.Options
+            {
+                DbPath = dbPath,
+                Client = "codex",
+                Agent = "probe-b",
+                SessionId = "11111111-1111-1111-1111-111111111111",
+                Since = 0,
+                Once = true,
+                TimeoutSeconds = 5,
+            }, new StringWriter(), CancellationToken.None, (_, _) => throw new HttpRequestException("actively refused"));
+
+            Assert.Equal(1, rcOnce);
+        }
+        finally
+        {
+            CleanupDir(dir);
+        }
+    }
+
+    private sealed class SignalStringWriter(string needle, TaskCompletionSource tcs) : StringWriter
+    {
+        public override void WriteLine(string? value)
+        {
+            base.WriteLine(value);
+            if (value is not null && value.Contains(needle, StringComparison.Ordinal))
+                tcs.TrySetResult();
         }
     }
 
