@@ -1,3 +1,4 @@
+using System.Runtime.Versioning;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -102,6 +103,12 @@ public static class NamedBoardEvent
     public static void Broadcast(string dbPath)
     {
         if (!OperatingSystem.IsWindows()) return;
+        BroadcastWindows(dbPath);
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static void BroadcastWindows(string dbPath)
+    {
         try
         {
             var dir = EventsDirectoryFor(dbPath);

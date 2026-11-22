@@ -313,8 +313,21 @@ public static partial class BoardTail
             }
             catch { }
         }
+
+        if (OperatingSystem.IsMacOS())
+        {
+            try
+            {
+                var ppid = getppid();
+                if (ppid > 0) return ppid;
+            }
+            catch { }
+        }
         return null;
     }
+
+    [DllImport("libc")]
+    private static extern int getppid();
 
     private static int? TryGetWindowsParentPid(int pid)
     {

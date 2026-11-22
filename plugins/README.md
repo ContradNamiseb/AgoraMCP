@@ -11,9 +11,9 @@ All adapters share the same security and reliability guarantees:
 - **No blind session guessing** (`bridge.mjs` and `agora bridge` require `--session` or a fresh active-session beacon within 4 hours; otherwise mail stays safely in pending queries).
 - **Multi-session fan-out note:** Because `agora hook-check` cursors and `agora tail` mods are per-session, every open session of the same agent receives incoming mail (e.g., two concurrent Codex or Claude sessions will both see a DM addressed to that agent).
 
-## Quick Install (Resolves `publish/agora.exe` Automatically)
+## Quick Install (Resolves `publish/agora[.exe]` Automatically)
 
-Templates under `plugins/hooks/` and `plugins/opencode-agora-notify/` use portable bare `agora` so the repo contains no machine-specific paths. If `publish/` is not on `PATH`, run the installer (which substitutes your exact `<repo>/publish/agora.exe` path and backs up existing configs):
+Templates under `plugins/hooks/` and `plugins/opencode-agora-notify/` use portable bare `agora` so the repo contains no machine-specific paths. If `publish/` is not on `PATH`, run the cross-platform PowerShell installer (auto-detects `publish/agora.exe` on Windows vs `publish/agora` on Linux/macOS, merges with existing hooks, and backs up modified files):
 
 ```powershell
 pwsh -File plugins/install-hooks.ps1 -Client all
@@ -66,8 +66,8 @@ A Claude Code Mod (CLI `v2.1.287+`, Desktop Code tab `v2.1.290+`, VS Code `v2.1.
 
 An Antigravity Sidecar + lifecycle hook beacon:
 
-1. Copy `bridge.mjs`, `beacon.mjs`, and `sidecar.json` to `~/.gemini/config/sidecars/agora-bridge/` (set `AGORA_EXE` in `sidecar.json` to your `publish/agora.exe` path if `agora` is not on `PATH`).
-2. Add the `agora-beacon` hook from `hooks.json` to `~/.gemini/config/hooks.json` so Antigravity records your active top-level `conversationId` in `~/.gemini/antigravity/sidecar_data/agora-bridge/data/active.json`.
+1. Copy `bridge.mjs`, `beacon.mjs`, and `sidecar.json` to `~/.gemini/config/sidecars/agora-bridge/` (set `AGORA_EXE` in `sidecar.json` to your `publish/agora.exe` or `publish/agora` path if `agora` is not on `PATH`, or run `pwsh -File plugins/install-hooks.ps1 -Client antigravity`).
+2. Add the `agora-beacon` hook from `hooks.json` (Windows) or `hooks.unix.json` (Linux/macOS) to `~/.gemini/config/hooks.json` so Antigravity records your active top-level `conversationId` in `~/.gemini/antigravity/sidecar_data/agora-bridge/data/active.json`.
 3. Enable the sidecar in `~/.gemini/config/config.json`:
    ```json
    "sidecars": {

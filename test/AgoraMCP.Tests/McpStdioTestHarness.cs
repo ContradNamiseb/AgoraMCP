@@ -30,8 +30,9 @@ internal static class BuiltApphost
                     System.IO.Path.AltDirectorySeparatorChar)).Name;
             var repoRoot = System.IO.Path.GetFullPath(System.IO.Path.Combine(
                 AppContext.BaseDirectory, "..", "..", "..", "..", ".."));
+            var exeName = OperatingSystem.IsWindows() ? "agora.exe" : "agora";
             var exe = System.IO.Path.Combine(repoRoot, "src", "AgoraMCP.McpServer",
-                "bin", "Release", tfm, "agora.exe");
+                "bin", "Release", tfm, exeName);
             Assert.True(File.Exists(exe),
                 $"expected the built apphost at {exe} (build the solution in Release first)");
             return exe;

@@ -1,14 +1,14 @@
 <#
 .SYNOPSIS
-  Install AgoraMCP push plugins and lifecycle hooks with the resolved publish\agora.exe path.
+  Install AgoraMCP push plugins and lifecycle hooks with the resolved publish/agora[.exe] path.
 
 .DESCRIPTION
   Repo templates under plugins/hooks/ and plugins/opencode-agora-notify/ keep bare
-  `agora` so git stays free of machine-specific paths. This script merges those
-  hooks into your user config directories using the absolute path to
-  `<repo>/publish/agora.exe` (or an explicit `-AgoraExe`), preserving any existing
-  hooks, skipping unchanged files (no duplicate backups on re-run), and backing
-  up every modified file before writing.
+  `agora` so git stays free of machine-specific paths. This script auto-detects
+  Windows (publish/agora.exe) vs Linux/macOS (publish/agora), merges hooks into
+  your user config directories, preserves any existing hooks, skips unchanged
+  files (no duplicate backups on re-run), and backs up every modified file before
+  writing.
 
 .EXAMPLE
   pwsh -File plugins/install-hooks.ps1 -Client all
@@ -23,14 +23,32 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
+$isWin = ($IsWindows -eq $true) -or ($env:OS -eq 'Windows_NT')
 $repoRoot = Split-Path -Parent $PSScriptRoot
+
+function Join-Segments([string]$base, [string[]]$segments) {
+    $p = $base
+    foreach ($seg in $segments) {
+        $p = Join-Path $p $seg
+    }
+    return $p
+}
+
 if ([string]::IsNullOrWhiteSpace($AgoraExe)) {
-    $AgoraExe = (Join-Path $repoRoot 'publish\agora.exe').Replace('\', '/')
+    $primary = Join-Segments $repoRoot @('publish', $(if ($isWin) { 'agora.exe' } else { 'agora' }))
+    $secondary = Join-Segments $repoRoot @('publish', $(if ($isWin) { 'agora' } else { 'agora.exe' }))
+    if (Test-Path -LiteralPath $primary) {
+        $AgoraExe = $primary.Replace('\', '/')
+    } elseif (Test-Path -LiteralPath $secondary) {
+        $AgoraExe = $secondary.Replace('\', '/')
+    } else {
+        $AgoraExe = $primary.Replace('\', '/')
+    }
 } else {
     $AgoraExe = $AgoraExe.Replace('\', '/')
 }
 if (-not (Test-Path -LiteralPath $AgoraExe)) {
-    throw "agora binary not found at '$AgoraExe'. Run publish.ps1 first or pass -AgoraExe."
+    throw "agora binary not found at '$AgoraExe'. Publish first (publish.ps1 on Windows or 'dotnet publish src/AgoraMCP.McpServer -c Release -o publish' on Linux/macOS) or pass -AgoraExe."
 }
 
 $targetHome = if ([string]::IsNullOrWhiteSpace($HomeDir)) { $HOME } else { $HomeDir }
@@ -97,7 +115,7 @@ function Sync-FileIfChanged([string]$path, [string]$content) {
 }
 
 if (Should-Install 'codex') {
-    $dst = Join-Path $targetHome '.codex\hooks.json'
+    $dst = Join-Segments $targetHome @('.codex', 'hooks.json')
     $cfg = if (Test-Path -LiteralPath $dst) {
         Get-Content -LiteralPath $dst -Raw | ConvertFrom-Json
     } else {
@@ -142,7 +160,7 @@ if (Should-Install 'codex') {
 }
 
 if (Should-Install 'cursor') {
-    $dst = Join-Path $targetHome '.cursor\hooks.json'
+    $dst = Join-Segments $targetHome @('.cursor', 'hooks.json')
     $cfg = if (Test-Path -LiteralPath $dst) {
         Get-Content -LiteralPath $dst -Raw | ConvertFrom-Json
     } else {
@@ -178,9 +196,10 @@ if (Should-Install 'cursor') {
 }
 
 if (Should-Install 'opencode') {
-    $dst = Join-Path $targetHome '.config\opencode\plugins\agora-ping.js'
+    $dst = Join-Segments $targetHome @('.config', 'opencode', 'plugins', 'agora-ping.js')
     $escapedJs = $AgoraExe.Replace('\', '\\').Replace('"', '\"')
-    $src = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'opencode-agora-notify\agora-ping.js'), $utf8).Replace('return "agora";', "return `"$escapedJs`";")
+    $srcPath = Join-Segments $PSScriptRoot @('opencode-agora-notify', 'agora-ping.js')
+    $src = [IO.File]::ReadAllText($srcPath, $utf8).Replace('return "agora";', "return `"$escapedJs`";")
     if (Sync-FileIfChanged $dst $src) {
         if ($DryRun) { Write-Output "[dry-run] would update $dst using $AgoraExe" }
         else { Write-Output "installed $dst" }
@@ -190,15 +209,15 @@ if (Should-Install 'opencode') {
 }
 
 if (Should-Install 'antigravity') {
-    $dir = Join-Path $targetHome '.gemini\config\sidecars\agora-bridge'
+    $dir = Join-Segments $targetHome @('.gemini', 'config', 'sidecars', 'agora-bridge')
     $bridgeDst = Join-Path $dir 'bridge.mjs'
     $beaconDst = Join-Path $dir 'beacon.mjs'
     $sidecarDst = Join-Path $dir 'sidecar.json'
 
-    $bridgeContent = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'antigravity-agora-bridge\bridge.mjs'), $utf8)
-    $beaconContent = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'antigravity-agora-bridge\beacon.mjs'), $utf8)
+    $bridgeContent = [IO.File]::ReadAllText((Join-Segments $PSScriptRoot @('antigravity-agora-bridge', 'bridge.mjs')), $utf8)
+    $beaconContent = [IO.File]::ReadAllText((Join-Segments $PSScriptRoot @('antigravity-agora-bridge', 'beacon.mjs')), $utf8)
     $escapedJsonExe = $AgoraExe.Replace('\', '\\').Replace('"', '\"')
-    $sidecarContent = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'antigravity-agora-bridge\sidecar.json'), $utf8).Replace('"AGORA_EXE": "agora"', "`"AGORA_EXE`": `"$escapedJsonExe`"")
+    $sidecarContent = [IO.File]::ReadAllText((Join-Segments $PSScriptRoot @('antigravity-agora-bridge', 'sidecar.json')), $utf8).Replace('"AGORA_EXE": "agora"', "`"AGORA_EXE`": `"$escapedJsonExe`"")
 
     $updatedFiles = @()
     if (Sync-FileIfChanged $bridgeDst $bridgeContent) { $updatedFiles += 'bridge.mjs' }
@@ -215,7 +234,7 @@ if (Should-Install 'antigravity') {
 }
 
 if (Should-Install 'kimi') {
-    $dst = Join-Path $targetHome '.kimi-code\config.toml'
+    $dst = Join-Segments $targetHome @('.kimi-code', 'config.toml')
     if (-not (Test-Path -LiteralPath $dst)) {
         Write-Output "skipped kimi ($dst not found)"
     } else {
@@ -249,7 +268,7 @@ timeout = 5
 }
 
 if (Should-Install 'zcode') {
-    $dst = Join-Path $targetHome '.zcode\cli\config.json'
+    $dst = Join-Segments $targetHome @('.zcode', 'cli', 'config.json')
     if (-not (Test-Path -LiteralPath $dst)) {
         Write-Output "skipped zcode ($dst not found)"
     } else {
