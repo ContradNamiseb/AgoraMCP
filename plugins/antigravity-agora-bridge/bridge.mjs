@@ -5,7 +5,7 @@
 
 import { execFileSync, spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, watch, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -17,8 +17,11 @@ const DATA_DIR =
   join(homedir(), '.gemini', 'antigravity', 'sidecar_data', 'agora-bridge', 'data')
 const ACTIVE_FILE = join(DATA_DIR, 'active.json')
 const CAP_FILE = join(DATA_DIR, 'wake-cap.json')
+const DEFERRED_FILE = join(DATA_DIR, 'deferred.json')
 
-const ACTIVE_MAX_AGE_MS = parseNonNegativeInt(process.env.AGORA_ACTIVE_MAX_AGE_MS, 4 * 60 * 60 * 1000)
+const ACTIVE_MAX_AGE_MS = parseNonNegativeInt(process.env.AGORA_ACTIVE_MAX_AGE_MS, 24 * 60 * 60 * 1000)
+const DEFERRED_MAX_AGE_MS = parseNonNegativeInt(process.env.AGORA_DEFERRED_MAX_AGE_MS, 72 * 60 * 60 * 1000)
+const MAX_DEFERRED_EVENTS = 5
 const MAX_WAKES_PER_THREAD = parseNonNegativeInt(process.env.AGORA_MAX_WAKES_PER_THREAD, 6)
 const MAX_GLOBAL_WAKES = parseNonNegativeInt(process.env.AGORA_MAX_GLOBAL_WAKES, 15)
 const MAX_BODY_CHARS = 3000
@@ -300,11 +303,134 @@ function sendViaAgentApi(conversationId, title, content) {
   })
 }
 
-function deliverEvent(ev) {
+let deferredEvents = []
+let activeWatcher = null
+let activeDebounceTimer = null
+
+function eventDedupKey(ev) {
+  return `${ev?.msg ?? 0}:${ev?.turn_seq ?? 0}:${ev?.seq ?? 0}`
+}
+
+function loadDeferredEvents() {
+  try {
+    if (!existsSync(DEFERRED_FILE)) return
+    const raw = JSON.parse(readFileSync(DEFERRED_FILE, 'utf-8'))
+    if (!Array.isArray(raw)) return
+    const now = Date.now()
+    deferredEvents = raw
+      .filter(
+        (item) =>
+          item &&
+          item.ev &&
+          typeof item.queuedAt === 'number' &&
+          (DEFERRED_MAX_AGE_MS <= 0 || now - item.queuedAt <= DEFERRED_MAX_AGE_MS),
+      )
+      .slice(-MAX_DEFERRED_EVENTS)
+  } catch {
+    deferredEvents = []
+  }
+}
+
+function saveDeferredEvents() {
+  try {
+    mkdirSync(DATA_DIR, { recursive: true })
+    const tmp = `${DEFERRED_FILE}.tmp.${process.pid}`
+    writeFileSync(tmp, JSON.stringify(deferredEvents), 'utf-8')
+    renameSync(tmp, DEFERRED_FILE)
+  } catch {
+    // Ignore deferred persistence failure.
+  }
+}
+
+function stopActiveWatcher() {
+  if (activeDebounceTimer) {
+    clearTimeout(activeDebounceTimer)
+    activeDebounceTimer = null
+  }
+  if (activeWatcher) {
+    try {
+      activeWatcher.close()
+    } catch {
+      // Already closed.
+    }
+    activeWatcher = null
+  }
+}
+
+function watchActiveForResume() {
+  if (stopping || activeWatcher || deferredEvents.length === 0) return
+  try {
+    mkdirSync(DATA_DIR, { recursive: true })
+    activeWatcher = watch(DATA_DIR, { persistent: false }, (_eventType, filename) => {
+      if (filename && String(filename) !== 'active.json') return
+      if (activeDebounceTimer) clearTimeout(activeDebounceTimer)
+      activeDebounceTimer = setTimeout(() => {
+        activeDebounceTimer = null
+        flushDeferredEvents()
+      }, 250)
+    })
+    activeWatcher.on('error', () => {
+      stopActiveWatcher()
+    })
+  } catch {
+    stopActiveWatcher()
+  }
+}
+
+function queueDeferredEvent(ev, reason) {
+  const key = eventDedupKey(ev)
+  if (!deferredEvents.some((item) => eventDedupKey(item.ev) === key)) {
+    deferredEvents.push({ queuedAt: Date.now(), ev })
+    if (deferredEvents.length > MAX_DEFERRED_EVENTS) {
+      deferredEvents = deferredEvents.slice(-MAX_DEFERRED_EVENTS)
+    }
+    saveDeferredEvents()
+  }
+  log(
+    `deferring wake for msg #${ev.msg} from ${ev.author} (${reason}); queued (${deferredEvents.length}/${MAX_DEFERRED_EVENTS}) to auto-deliver when you return.`,
+  )
+  watchActiveForResume()
+}
+
+function flushDeferredEvents() {
+  if (deferredEvents.length === 0) {
+    stopActiveWatcher()
+    return
+  }
+  const now = Date.now()
+  if (DEFERRED_MAX_AGE_MS > 0) {
+    const before = deferredEvents.length
+    deferredEvents = deferredEvents.filter((item) => now - item.queuedAt <= DEFERRED_MAX_AGE_MS)
+    if (deferredEvents.length !== before) saveDeferredEvents()
+  }
+  if (deferredEvents.length === 0) {
+    stopActiveWatcher()
+    return
+  }
   const target = resolveTargetConversation()
   if (!target.id) {
-    log(`skipping wake for msg #${ev.msg} from ${ev.author} (${target.reason}); mail stays in pending queries.`)
+    watchActiveForResume()
     return
+  }
+  const batch = deferredEvents.slice()
+  deferredEvents = []
+  saveDeferredEvents()
+  stopActiveWatcher()
+  log(`active conversation resumed (${target.id}); delivering ${batch.length} deferred message(s).`)
+  for (const item of batch) {
+    deliverEvent(item.ev, true)
+  }
+}
+
+function deliverEvent(ev, isFlush = false) {
+  const target = resolveTargetConversation()
+  if (!target.id) {
+    if (!isFlush) queueDeferredEvent(ev, target.reason)
+    return
+  }
+
+  if (!isFlush && deferredEvents.length > 0) {
+    flushDeferredEvents()
   }
 
   if (!allowWakeForThread(ev.thread, target.updatedAt)) {
@@ -330,6 +456,7 @@ let backoffMs = 2000
 
 function shutdown() {
   stopping = true
+  stopActiveWatcher()
   if (child) {
     try {
       child.kill()
@@ -354,6 +481,7 @@ function startTail() {
     String(process.pid),
     '--exit-on-stdin-eof',
     '--emit-ready',
+    '--resume',
   ]
   if (AGORA_DB.length > 0) argv.push('--db', AGORA_DB)
 
@@ -440,4 +568,6 @@ function startTail() {
   })
 }
 
+loadDeferredEvents()
+flushDeferredEvents()
 startTail()

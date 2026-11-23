@@ -1467,6 +1467,71 @@ public sealed class HookAndBridgeTests
             ctsEx.Cancel();
             Assert.Equal(0, await tEx);
             Assert.Equal(3, exhaustAttempts); // 1 initial + 2 retries, then advanced!
+
+            // Doctor immutable read-only check (Finding A): cleanly closed WAL DB must NOT gain -wal/-shm files!
+            var cleanWalDb = Path.Combine(dir, "clean-closed.db");
+            using (var db = AgoraDatabase.Open(cleanWalDb))
+            {
+                DmStore.Send(db, "antigravity", "codex", "closed wal row");
+                db.Execute("PRAGMA wal_checkpoint(TRUNCATE)");
+            }
+            SqliteConnection.ClearAllPools();
+            Assert.False(File.Exists(cleanWalDb + "-wal"));
+            Assert.False(File.Exists(cleanWalDb + "-shm"));
+            var cleanDocSw = new StringWriter();
+            Assert.Equal(0, Doctor.Run(cleanWalDb, cleanDocSw));
+            Assert.Contains("db status: OK", cleanDocSw.ToString());
+            Assert.Contains("journal=wal", cleanDocSw.ToString());
+            Assert.False(File.Exists(cleanWalDb + "-wal"), "Doctor created -wal on a cleanly closed DB!");
+            Assert.False(File.Exists(cleanWalDb + "-shm"), "Doctor created -shm on a cleanly closed DB!");
+
+            // BoardTail --resume: seeds silently on first run, catches up mail posted while closed,
+            // caps startup catch-up burst to ResumeLimit, and reseeds when cursor exceeds ResumeWindowSeconds.
+            var resumeDb = Path.Combine(dir, "tail-resume.db");
+            using (var db = AgoraDatabase.Open(resumeDb))
+                DmStore.Send(db, "antigravity", "claudecode", "ancient before first tail");
+
+            // 1. First-ever --resume run seeds silently at MAX (does not emit historical mail).
+            var seedSw = new StringWriter();
+            Assert.Equal(0, await BoardTail.RunAsync(new BoardTail.Options
+            {
+                DbPath = resumeDb, Agent = "claudecode", Resume = true,
+                TimeoutSeconds = 0.2, IntervalSeconds = 0.1,
+            }, seedSw));
+            Assert.Equal("", seedSw.ToString().Trim());
+
+            // 2. While closed, 7 DMs arrive; reopening with --resume (ResumeLimit=3) catches up the newest 3!
+            using (var db = AgoraDatabase.Open(resumeDb))
+            {
+                for (var i = 1; i <= 7; i++)
+                    DmStore.Send(db, "antigravity", "claudecode", $"missed-while-closed-{i}");
+            }
+            var catchupSw = new StringWriter();
+            Assert.Equal(0, await BoardTail.RunAsync(new BoardTail.Options
+            {
+                DbPath = resumeDb, Agent = "claudecode", Resume = true, ResumeLimit = 3,
+                Once = true, TimeoutSeconds = 3, IntervalSeconds = 0.1,
+            }, catchupSw));
+            var catchupLines = catchupSw.ToString().Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries);
+            Assert.Equal(3, catchupLines.Length);
+            Assert.Contains("missed-while-closed-5", catchupLines[0]);
+            Assert.Contains("missed-while-closed-7", catchupLines[2]);
+
+            // 3. Stale cursor (> ResumeWindowSeconds) reseeds at MAX instead of replaying ancient mail.
+            var cursorPath = BoardTail.ResolveCursorPath(resumeDb, "claudecode", null);
+            HookCheck.WriteJsonAtomic(cursorPath, new BoardTail.TailCursorState
+            {
+                LastMsgId = 1,
+                LastTurnId = 0,
+                UpdatedAt = DateTimeOffset.UtcNow.AddHours(-48).ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'"),
+            });
+            var staleSw = new StringWriter();
+            Assert.Equal(0, await BoardTail.RunAsync(new BoardTail.Options
+            {
+                DbPath = resumeDb, Agent = "claudecode", Resume = true, ResumeWindowSeconds = 3600,
+                TimeoutSeconds = 0.2, IntervalSeconds = 0.1,
+            }, staleSw));
+            Assert.Equal("", staleSw.ToString().Trim());
         }
         finally
         {

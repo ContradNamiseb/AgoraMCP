@@ -29,7 +29,7 @@ public static class ClientBridge
 {
     public const string DefaultKimiWebUrl = "http://127.0.0.1:58627";
     public const string DefaultOpenCodeUrl = "http://127.0.0.1:4096";
-    public const double DefaultSessionMaxAgeSeconds = 4 * 60 * 60; // 4 hours
+    public const double DefaultSessionMaxAgeSeconds = 24 * 60 * 60; // 24 hours
     public const double DefaultWakeCooldownSeconds = 60 * 60; // 60 min loop-breaker latch
     public const int DefaultMaxGlobalWakes = 15;
     /// <summary>Default bounded backoff schedule (5s, 30s, 2m) for transient dispatch failures (I1).</summary>

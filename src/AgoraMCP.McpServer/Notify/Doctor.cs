@@ -41,16 +41,24 @@ public static class Doctor
             try
             {
                 var sizeKb = new FileInfo(fullDb).Length / 1024.0;
-                // Strictly read-only: doctor MUST NOT migrate or create WAL/SHM files.
-                using var db = new SqliteConnection(new SqliteConnectionStringBuilder
-                {
-                    DataSource = fullDb,
-                    Mode = SqliteOpenMode.ReadOnly,
-                    Pooling = false,
-                }.ToString());
+                // Strictly read-only: when no -wal/-shm sidecar exists, open with
+                // immutable=1 so SQLite creates ZERO -wal/-shm files on a cleanly closed DB;
+                // when -wal exists, use standard ReadOnly so live WAL writes remain visible.
+                var hasWalSidecar = File.Exists(fullDb + "-wal") || File.Exists(fullDb + "-shm");
+                var connStr = hasWalSidecar
+                    ? new SqliteConnectionStringBuilder
+                    {
+                        DataSource = fullDb,
+                        Mode = SqliteOpenMode.ReadOnly,
+                        Pooling = false,
+                    }.ToString()
+                    : $"Data Source={new Uri(fullDb).AbsoluteUri}?mode=ro&immutable=1;Pooling=False";
+                using var db = new SqliteConnection(connStr);
                 db.Open();
 
                 var journal = db.Scalar<string>("PRAGMA journal_mode");
+                if (!hasWalSidecar && IsWalHeader(fullDb))
+                    journal = "wal";
                 var userVer = db.Scalar<long>("PRAGMA user_version");
                 var needsMigration = userVer < Migrations.CurrentVersion;
 
@@ -175,6 +183,20 @@ public static class Doctor
         }
 
         return 0;
+    }
+
+    private static bool IsWalHeader(string dbPath)
+    {
+        try
+        {
+            using var fs = new FileStream(dbPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            Span<byte> hdr = stackalloc byte[20];
+            return fs.Read(hdr) >= 20 && hdr[18] == 2 && hdr[19] == 2;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static bool TableExists(SqliteConnection db, string table) =>

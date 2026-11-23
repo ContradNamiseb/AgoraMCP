@@ -1,7 +1,10 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using AgoraMCP.McpServer.Watch;
 
 namespace AgoraMCP.McpServer.Notify;
@@ -19,11 +22,26 @@ namespace AgoraMCP.McpServer.Notify;
 /// </summary>
 public static partial class BoardTail
 {
+    public const double DefaultResumeWindowSeconds = 24 * 60 * 60; // 24 hours
+    public const int DefaultResumeLimit = 5;
+
+    public sealed class TailCursorState
+    {
+        [JsonPropertyName("last_msg_id")]
+        public long LastMsgId { get; set; }
+
+        [JsonPropertyName("last_turn_id")]
+        public long LastTurnId { get; set; }
+
+        [JsonPropertyName("updated_at")]
+        public string UpdatedAt { get; set; } = "";
+    }
+
     public sealed record Options
     {
         public required string DbPath { get; init; }
         public required string Agent { get; init; }
-        /// <summary>Starting message cursor; null = start at current MAX(id) (live only).</summary>
+        /// <summary>Starting message cursor; null = start at current MAX(id) (or saved cursor when Resume=true).</summary>
         public long? Since { get; init; }
         /// <summary>Starting turn_events cursor; null = start at current MAX(id) (or 0 when Since == 0).</summary>
         public long? SinceTurn { get; init; }
@@ -45,6 +63,56 @@ public static partial class BoardTail
         public bool ExitOnStdinEof { get; init; }
         /// <summary>Emit an initial {"kind":"ready","seq":...,"turn_seq":...} control line right after cursor sampling (I2).</summary>
         public bool EmitReady { get; init; }
+        /// <summary>Persist cursor beside --db and catch up unread mail missed while closed/restarting (ignored when --since is given).</summary>
+        public bool Resume { get; init; }
+        /// <summary>Max age (seconds) of a saved resume cursor before reseeding at MAX(id) (default 24h; 0 = unlimited).</summary>
+        public double ResumeWindowSeconds { get; init; } = DefaultResumeWindowSeconds;
+        /// <summary>Max unread events emitted on the initial startup catch-up pass (default 5; 0 = unlimited).</summary>
+        public int ResumeLimit { get; init; } = DefaultResumeLimit;
+        /// <summary>Optional explicit path for the --resume cursor file (defaults to &lt;dbDir&gt;/tail-state/tail-&lt;dbHash8&gt;-&lt;agentKey&gt;.json).</summary>
+        public string? CursorFilePath { get; init; }
+    }
+
+    internal static string ResolveCursorPath(string dbPath, string agent, string? explicitPath)
+    {
+        if (!string.IsNullOrWhiteSpace(explicitPath))
+            return explicitPath!;
+        var fullDb = Path.GetFullPath(dbPath);
+        var dbDir = Path.GetDirectoryName(fullDb);
+        var root = string.IsNullOrEmpty(dbDir) ? Path.GetTempPath() : dbDir;
+        var dbKey = Convert.ToHexString(SHA256.HashData(
+            Encoding.UTF8.GetBytes(OperatingSystem.IsWindows() ? fullDb.ToLowerInvariant() : fullDb)))[..8].ToLowerInvariant();
+        return Path.Combine(root, "tail-state", $"tail-{dbKey}-{HookCheck.AgentFileKey(agent)}.json");
+    }
+
+    internal static TailCursorState? LoadCursorState(string path)
+    {
+        try
+        {
+            if (!File.Exists(path)) return null;
+            return JsonSerializer.Deserialize<TailCursorState>(File.ReadAllText(path, Encoding.UTF8));
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    internal static void SaveCursorMonotonic(string path, long msgSeq, long turnSeq)
+    {
+        try
+        {
+            var existing = LoadCursorState(path);
+            var nextMsg = existing is not null ? Math.Max(existing.LastMsgId, msgSeq) : msgSeq;
+            var nextTurn = existing is not null ? Math.Max(existing.LastTurnId, turnSeq) : turnSeq;
+            HookCheck.WriteJsonAtomic(path, new TailCursorState
+            {
+                LastMsgId = nextMsg,
+                LastTurnId = nextTurn,
+                UpdatedAt = DateTimeOffset.UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'"),
+            });
+        }
+        catch { }
     }
 
     public static async Task<int> RunAsync(
@@ -102,13 +170,57 @@ public static partial class BoardTail
             ownEvent = null;
         }
 
+        var cursorPath = options.Resume ? ResolveCursorPath(dbPath, agent, options.CursorFilePath) : null;
+        long cursor = 0;
+        long turnCursor = 0;
+        var hasSampledCursor = false;
+        var pipeBroken = false;
+
         try
         {
-            var cursor = options.Since ?? NotifyHub.ReadMaxSeq(dbPath);
-            var turnCursor = options.SinceTurn
-                ?? (options.Since == 0 ? 0 : NotifyHub.ReadMaxTurnSeq(dbPath));
+            var resumedFromSaved = false;
+            if (options.Since is null && options.SinceTurn is null && cursorPath is not null)
+            {
+                var saved = LoadCursorState(cursorPath);
+                var fresh = false;
+                if (saved is not null)
+                {
+                    if (options.ResumeWindowSeconds <= 0)
+                    {
+                        fresh = true;
+                    }
+                    else if (!string.IsNullOrWhiteSpace(saved.UpdatedAt) &&
+                             DateTimeOffset.TryParse(saved.UpdatedAt, CultureInfo.InvariantCulture,
+                                 DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var savedAt))
+                    {
+                        fresh = (DateTimeOffset.UtcNow - savedAt).TotalSeconds <= options.ResumeWindowSeconds;
+                    }
+                }
 
-            NotifyLog.Write("tail", agent, "started", cursor, turnCursor, dbPath: dbPath);
+                if (fresh && saved is not null)
+                {
+                    cursor = saved.LastMsgId;
+                    turnCursor = saved.LastTurnId;
+                    resumedFromSaved = true;
+                    NotifyLog.Write("tail", agent, $"started (resumed from {cursor}/{turnCursor})", cursor, turnCursor, dbPath: dbPath);
+                }
+                else
+                {
+                    cursor = NotifyHub.ReadMaxSeq(dbPath);
+                    turnCursor = NotifyHub.ReadMaxTurnSeq(dbPath);
+                    SaveCursorMonotonic(cursorPath, cursor, turnCursor);
+                    var reason = saved is not null ? "started (resume cursor stale; seeded at MAX)" : "started (seeded cursor at MAX)";
+                    NotifyLog.Write("tail", agent, reason, cursor, turnCursor, dbPath: dbPath);
+                }
+            }
+            else
+            {
+                cursor = options.Since ?? NotifyHub.ReadMaxSeq(dbPath);
+                turnCursor = options.SinceTurn
+                    ?? (options.Since == 0 ? 0 : NotifyHub.ReadMaxTurnSeq(dbPath));
+                NotifyLog.Write("tail", agent, "started", cursor, turnCursor, dbPath: dbPath);
+            }
+            hasSampledCursor = true;
 
             if (options.EmitReady)
             {
@@ -131,12 +243,16 @@ public static partial class BoardTail
             var firstPass = true;
             while (!linkedToken.IsCancellationRequested)
             {
+                var isStartupPass = firstPass;
                 if (!firstPass)
                 {
                     if (watchedParent is not null && SafeHasExited(watchedParent))
                         return 0;
                     if (checkStdoutPipe && IsWindowsStdoutPipeBroken())
+                    {
+                        pipeBroken = true;
                         return 0;
+                    }
 
                     var wait = fallback;
                     if (deadline is { } dl)
@@ -159,7 +275,10 @@ public static partial class BoardTail
                 if (watchedParent is not null && SafeHasExited(watchedParent))
                     return 0;
                 if (checkStdoutPipe && IsWindowsStdoutPipeBroken())
+                {
+                    pipeBroken = true;
                     return 0;
+                }
 
                 try
                 {
@@ -172,8 +291,12 @@ public static partial class BoardTail
                         dmsOnly: options.DmsOnly,
                         excludeSelf: true);
 
-                    if (maxSeq > cursor) cursor = maxSeq;
-                    if (maxTurnSeq > turnCursor) turnCursor = maxTurnSeq;
+                    if (resumedFromSaved && isStartupPass && options.ResumeLimit > 0 && events.Count > options.ResumeLimit)
+                    {
+                        var dropped = events.Count - options.ResumeLimit;
+                        events = events.Skip(dropped).ToList();
+                        NotifyLog.Write("tail", agent, $"resume catch-up capped to newest {options.ResumeLimit} ({dropped} older left in pending queries)", cursor, turnCursor, dbPath: dbPath);
+                    }
 
                     if (events.Count > 0)
                     {
@@ -182,14 +305,30 @@ public static partial class BoardTail
                             output.WriteLine(JsonSerializer.Serialize(ev));
                             output.Flush();
                             if (checkStdoutPipe && IsWindowsStdoutPipeBroken())
+                            {
+                                pipeBroken = true;
                                 return 0;
+                            }
+                            if (ev.MsgId > cursor) cursor = ev.MsgId;
+                            else if (ev.Seq > cursor) cursor = ev.Seq;
+                            if (ev.TurnSeq is long ts && ts > turnCursor) turnCursor = ts;
+                            if (cursorPath is not null)
+                                SaveCursorMonotonic(cursorPath, cursor, turnCursor);
                         }
-                        if (options.Once) return 0;
                     }
+
+                    var advanced = false;
+                    if (maxSeq > cursor) { cursor = maxSeq; advanced = true; }
+                    if (maxTurnSeq > turnCursor) { turnCursor = maxTurnSeq; advanced = true; }
+                    if (advanced && cursorPath is not null)
+                        SaveCursorMonotonic(cursorPath, cursor, turnCursor);
+
+                    if (events.Count > 0 && options.Once) return 0;
                 }
                 catch (IOException)
                 {
                     // Downstream stdout pipe closed -> parent is gone.
+                    pipeBroken = true;
                     return 0;
                 }
                 catch (Exception e) when (e is not OperationCanceledException)
@@ -204,6 +343,9 @@ public static partial class BoardTail
         }
         finally
         {
+            // Refresh updated_at on clean exit so the resume window counts from session close.
+            if (cursorPath is not null && hasSampledCursor && !pipeBroken)
+                SaveCursorMonotonic(cursorPath, cursor, turnCursor);
             if (ownEvent is not null)
             {
                 NamedBoardEvent.Unregister(dbPath, listenerId);

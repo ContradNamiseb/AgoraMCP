@@ -242,7 +242,7 @@ async function runTailLoop($, generation, exe, agent, dbPath) {
     let buffer = ''
     let stderrLogged = 0
     const startedAt = await $.clock.now()
-    const argv = [exe, 'tail', '--agent', agent, '--exit-with-parent', '--emit-ready']
+    const argv = [exe, 'tail', '--agent', agent, '--exit-with-parent', '--emit-ready', '--resume']
     if (dbPath && dbPath.trim().length > 0) {
       argv.push('--db', dbPath.trim())
     }

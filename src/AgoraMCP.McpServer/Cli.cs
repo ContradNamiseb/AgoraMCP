@@ -420,8 +420,9 @@ internal static class Cli
                [--timeout S] [--interval S]  (starts at now unless --since is given);
                [--parent-pid PID]            --exit-with-parent / --parent-pid /
                [--exit-with-parent]          --exit-on-stdin-eof exit when host dies;
-               [--exit-on-stdin-eof]         --emit-ready prints initial cursor handshake
-               [--emit-ready]
+               [--exit-on-stdin-eof]         --emit-ready prints initial cursor handshake;
+               [--emit-ready] [--resume]     --resume catches up mail missed while closed
+               [--resume-window-sec S] [--resume-limit N] [--cursor-file P]
           hook-check --agent NAME            lifecycle hook check for SessionStart,
                [--format FMT] [--event EV]   UserPromptSubmit, PostToolUse, and Stop across
                [--record-session]            Codex, Cursor, VS Code, Copilot, Kimi, ZCode,

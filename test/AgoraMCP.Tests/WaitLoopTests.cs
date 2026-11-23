@@ -113,14 +113,17 @@ public sealed class WaitLoopTests
         PresenceStore.Heartbeat(db, "quiet-peer", "kernel");
         var id = ThreadStore.PostQuestion(db, "long question", "", "poster");
 
-        var start = DateTime.UtcNow;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
         var result = await ThreadStore.WaitForAnswerAsync(db, id,
             new ThreadStore.WaitOptions { PollIntervalSeconds = 0.2, TimeoutSeconds = 5 });
-        var elapsed = (DateTime.UtcNow - start).TotalSeconds;
+        sw.Stop();
+        var elapsed = sw.Elapsed.TotalSeconds;
 
         Assert.Equal(WaitStatus.Timeout, result.Status);
         Assert.Empty(result.Messages);
-        Assert.InRange(elapsed, 4.0, 7.0);
+        // Must wait at least ~4s (proving it respected the 5s timeout) and stop well before
+        // the 120s default even when the parallel test suite saturates the thread pool.
+        Assert.InRange(elapsed, 4.0, 15.0);
     }
 
     [Fact]

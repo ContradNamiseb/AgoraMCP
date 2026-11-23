@@ -317,6 +317,7 @@ export default Plugin.define({
         String(process.pid),
         "--exit-on-stdin-eof",
         "--emit-ready",
+        "--resume",
       ];
       if (dbPath.length > 0) argv.push("--db", dbPath);
       if (hasCursor) {

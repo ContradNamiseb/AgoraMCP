@@ -132,6 +132,8 @@ internal static class Program
         if (!TryParseOptionalDouble(args, "--timeout", "tail", out var timeout)) return 2;
         if (!TryParseOptionalDouble(args, "--interval", "tail", out var interval)) return 2;
         if (!TryParseOptionalInt(args, "--parent-pid", "tail", out var parentPid)) return 2;
+        if (!TryParseOptionalNonNegativeDouble(args, "--resume-window-sec", "tail", out var resumeWindow)) return 2;
+        if (!TryParseOptionalInt(args, "--resume-limit", "tail", out var resumeLimit)) return 2;
 
         var cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
@@ -150,6 +152,10 @@ internal static class Program
             ExitWithParent = args.Contains("--exit-with-parent"),
             ExitOnStdinEof = args.Contains("--exit-on-stdin-eof"),
             EmitReady = args.Contains("--emit-ready"),
+            Resume = args.Contains("--resume"),
+            ResumeWindowSeconds = resumeWindow ?? Notify.BoardTail.DefaultResumeWindowSeconds,
+            ResumeLimit = resumeLimit ?? Notify.BoardTail.DefaultResumeLimit,
+            CursorFilePath = Option(args, "--cursor-file"),
         }, stdout: null, token: cts.Token).GetAwaiter().GetResult();
     }
 
