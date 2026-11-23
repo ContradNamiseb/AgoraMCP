@@ -25,7 +25,8 @@ public sealed record BoardEvent(
     [property: JsonPropertyName("directed_to")] string DirectedTo,
     [property: JsonPropertyName("at")] string CreatedAt,
     [property: JsonPropertyName("body")] string Body = "",
-    [property: JsonPropertyName("turn_seq"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] long? TurnSeq = null);
+    [property: JsonPropertyName("turn_seq"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] long? TurnSeq = null,
+    [property: JsonPropertyName("omitted_older"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? OmittedOlder = null);
 
 /// <summary>
 /// In-binary push fan-out: a resident loopback SSE hub. No scripts, no

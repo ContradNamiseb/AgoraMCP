@@ -1500,22 +1500,36 @@ public sealed class HookAndBridgeTests
             }, seedSw));
             Assert.Equal("", seedSw.ToString().Trim());
 
-            // 2. While closed, 7 DMs arrive; reopening with --resume (ResumeLimit=3) catches up the newest 3!
+            // 2. While closed, 7 DMs + 1 standalone turn pass arrive (= 8 unread); reopening with --resume
+            //    (default ResumeLimit=5) emits the newest 5, puts omitted_older=3 ONLY on the first event,
+            //    and HookCheck.FormatSingleEvent surfaces the skipped-count notice to the agent!
             using (var db = AgoraDatabase.Open(resumeDb))
             {
                 for (var i = 1; i <= 7; i++)
                     DmStore.Send(db, "antigravity", "claudecode", $"missed-while-closed-{i}");
+                var tid = ThreadStore.PostQuestion(db, "gap-turn", "context", "antigravity");
+                TurnStore.Pass(db, tid, "antigravity", "claudecode", "review gap pass");
             }
             var catchupSw = new StringWriter();
             Assert.Equal(0, await BoardTail.RunAsync(new BoardTail.Options
             {
-                DbPath = resumeDb, Agent = "claudecode", Resume = true, ResumeLimit = 3,
+                DbPath = resumeDb, Agent = "claudecode", Resume = true, ResumeLimit = 5,
                 Once = true, TimeoutSeconds = 3, IntervalSeconds = 0.1,
             }, catchupSw));
             var catchupLines = catchupSw.ToString().Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries);
-            Assert.Equal(3, catchupLines.Length);
-            Assert.Contains("missed-while-closed-5", catchupLines[0]);
-            Assert.Contains("missed-while-closed-7", catchupLines[2]);
+            Assert.Equal(5, catchupLines.Length);
+            Assert.Contains("missed-while-closed-4", catchupLines[0]);
+            Assert.Contains("review gap pass", catchupLines[4]);
+
+            var firstEv = JsonSerializer.Deserialize<BoardEvent>(catchupLines[0])!;
+            Assert.Equal(3, firstEv.OmittedOlder);
+            for (var i = 1; i < catchupLines.Length; i++)
+            {
+                using var d = JsonDocument.Parse(catchupLines[i]);
+                Assert.False(d.RootElement.TryGetProperty("omitted_older", out _));
+            }
+            var renderedFirst = HookCheck.FormatSingleEvent(firstEv);
+            Assert.Contains("[+3 older unread Agora message(s) not shown; check read_inbox / fetch_pending_queries]", renderedFirst);
 
             // 3. Stale cursor (> ResumeWindowSeconds) reseeds at MAX instead of replaying ancient mail.
             var cursorPath = BoardTail.ResolveCursorPath(resumeDb, "claudecode", null);
@@ -1532,6 +1546,64 @@ public sealed class HookAndBridgeTests
                 TimeoutSeconds = 0.2, IntervalSeconds = 0.1,
             }, staleSw));
             Assert.Equal("", staleSw.ToString().Trim());
+
+            // 4. Shared resume cursor lock (b): skips cleanly on busy lock, and parallel writers
+            //    with out-of-order/increasing values NEVER regress the saved cursor!
+            var raceCursorPath = Path.Combine(dir, "race-cursor.json");
+            BoardTail.SaveCursorMonotonic(raceCursorPath, 10, 5);
+            using (new FileStream(raceCursorPath + ".lock", FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None))
+            {
+                BoardTail.SaveCursorMonotonic(raceCursorPath, 999, 999, lockTimeoutMs: 40);
+            }
+            Assert.Equal(10, BoardTail.LoadCursorState(raceCursorPath)!.LastMsgId);
+
+            var gate = new ManualResetEventSlim(false);
+            using var stopObserver = new CancellationTokenSource();
+            var sawRegression = false;
+            var observer = Task.Run(() =>
+            {
+                long highWaterMsg = 0;
+                long highWaterTurn = 0;
+                while (!stopObserver.IsCancellationRequested)
+                {
+                    var snap = BoardTail.LoadCursorState(raceCursorPath);
+                    if (snap is not null)
+                    {
+                        if (snap.LastMsgId < highWaterMsg || snap.LastTurnId < highWaterTurn)
+                            sawRegression = true;
+                        if (snap.LastMsgId > highWaterMsg) highWaterMsg = snap.LastMsgId;
+                        if (snap.LastTurnId > highWaterTurn) highWaterTurn = snap.LastTurnId;
+                    }
+                    Thread.Sleep(1);
+                }
+            });
+
+            const int workerCount = 8;
+            const int stepsPerWorker = 10;
+            var workers = Enumerable.Range(1, workerCount).Select(w => Task.Run(() =>
+            {
+                gate.Wait();
+                for (var step = 1; step <= stepsPerWorker; step++)
+                {
+                    var targetMsg = 10 + (step * workerCount) + w;
+                    var targetTurn = 5 + (step * workerCount) + w;
+                    BoardTail.SaveCursorMonotonic(raceCursorPath, targetMsg, targetTurn, lockTimeoutMs: 5000);
+                }
+            })).ToArray();
+            gate.Set();
+            await Task.WhenAll(workers);
+            stopObserver.Cancel();
+            await observer;
+
+            var expectedMaxMsg = 10 + (stepsPerWorker * workerCount) + workerCount;
+            var expectedMaxTurn = 5 + (stepsPerWorker * workerCount) + workerCount;
+            Assert.False(sawRegression, "Resume cursor regressed during concurrent writes!");
+            var finalCursor = BoardTail.LoadCursorState(raceCursorPath)!;
+            Assert.Equal(expectedMaxMsg, finalCursor.LastMsgId);
+            Assert.Equal(expectedMaxTurn, finalCursor.LastTurnId);
+            // Also verify a late lower write never steps the file backward.
+            BoardTail.SaveCursorMonotonic(raceCursorPath, 50, 20);
+            Assert.Equal(expectedMaxMsg, BoardTail.LoadCursorState(raceCursorPath)!.LastMsgId);
         }
         finally
         {

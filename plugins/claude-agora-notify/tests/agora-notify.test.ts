@@ -391,3 +391,65 @@ test('I6 logs stderr and stops auto-restarting after 3 consecutive exit-2 usage 
   expect(logs.some((l) => l.includes('unknown option --emit-ready'))).toBe(true)
   expect(logs.some((l) => l.includes('stopping auto-restart'))).toBe(true)
 })
+
+test('resume omitted_older field surfaces unread skip notice in prompt text outside nonce frame', async ($, on) => {
+  mock.env(on, { AGORA_AGENT: 'claudecode', AGORA_EXE: 'C:/fake/agora.exe', AGORA_DB: '' })
+  mock.clock(on)
+  on('session.start', () => ({ cwd: '/work' }))
+  on('session.end', () => ({ sessionId: 's7' }))
+  on('command.register', () => ({ value: undefined }))
+  on('ui.toast', () => ({ value: undefined }))
+
+  const submitted: string[] = []
+  const gotTwo = deferred()
+  on('prompt.submit', (_$, e) => {
+    submitted.push(e.text)
+    if (submitted.length === 2) gotTwo.resolve()
+    return { text: e.text }
+  })
+
+  const ev1 = JSON.stringify({
+    seq: 904,
+    kind: 'dm',
+    thread: 61,
+    msg: 904,
+    author: 'antigravity',
+    topic: 'DM',
+    directed_to: 'claudecode',
+    at: '2026-11-23T08:00:00Z',
+    body: 'gap msg 4',
+    omitted_older: 3,
+  })
+  const ev2 = JSON.stringify({
+    seq: 905,
+    kind: 'dm',
+    thread: 61,
+    msg: 905,
+    author: 'antigravity',
+    topic: 'DM',
+    directed_to: 'claudecode',
+    at: '2026-11-23T08:00:01Z',
+    body: 'gap msg 5',
+  })
+
+  const holdOpen = deferred()
+  on('process.spawn', async function* () {
+    yield { stream: 'stdout', text: ev1 + '\n' + ev2 + '\n' }
+    await holdOpen.promise
+    return { value: { code: 0, signal: null } }
+  })
+
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  await gotTwo.promise
+  holdOpen.resolve()
+  await $.session.end({ reason: 'other' })
+
+  expect(submitted).toHaveLength(2)
+  expect(submitted[0]).toContain('[+3 older unread Agora message(s) not shown; check read_inbox / fetch_pending_queries]')
+  // Verify the notice appears AFTER the closing nonce tag (trusted framing, outside untrusted body).
+  const closeIdx = submitted[0].indexOf('<<<END_AGORA_PEER_MESSAGE:')
+  const noteIdx = submitted[0].indexOf('[+3 older unread Agora message(s)')
+  expect(closeIdx).toBeGreaterThan(-1)
+  expect(noteIdx).toBeGreaterThan(closeIdx)
+  expect(submitted[1]).not.toContain('older unread Agora message(s)')
+})

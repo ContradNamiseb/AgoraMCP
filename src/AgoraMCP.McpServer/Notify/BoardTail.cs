@@ -90,7 +90,7 @@ public static partial class BoardTail
         try
         {
             if (!File.Exists(path)) return null;
-            return JsonSerializer.Deserialize<TailCursorState>(File.ReadAllText(path, Encoding.UTF8));
+            return JsonSerializer.Deserialize<TailCursorState>(HookCheck.ReadAllTextShared(path));
         }
         catch
         {
@@ -98,10 +98,15 @@ public static partial class BoardTail
         }
     }
 
-    internal static void SaveCursorMonotonic(string path, long msgSeq, long turnSeq)
+    internal static void SaveCursorMonotonic(string path, long msgSeq, long turnSeq, int lockTimeoutMs = 500)
     {
         try
         {
+            // Serialize read-max-write across concurrent tails sharing one resume file;
+            // on timeout, skip this save so the next save or clean-exit refresh catches up.
+            using var fileLock = HookCheck.AcquireStateLock(path, lockTimeoutMs);
+            if (fileLock is null) return;
+
             var existing = LoadCursorState(path);
             var nextMsg = existing is not null ? Math.Max(existing.LastMsgId, msgSeq) : msgSeq;
             var nextTurn = existing is not null ? Math.Max(existing.LastTurnId, turnSeq) : turnSeq;
@@ -295,6 +300,7 @@ public static partial class BoardTail
                     {
                         var dropped = events.Count - options.ResumeLimit;
                         events = events.Skip(dropped).ToList();
+                        events[0] = events[0] with { OmittedOlder = dropped };
                         NotifyLog.Write("tail", agent, $"resume catch-up capped to newest {options.ResumeLimit} ({dropped} older left in pending queries)", cursor, turnCursor, dbPath: dbPath);
                     }
 

@@ -959,7 +959,7 @@ public static class ClientBridge
         try
         {
             if (!File.Exists(capStatePath)) return;
-            var data = JsonSerializer.Deserialize<PersistedWakeCaps>(File.ReadAllText(capStatePath, Encoding.UTF8));
+            var data = JsonSerializer.Deserialize<PersistedWakeCaps>(HookCheck.ReadAllTextShared(capStatePath));
             if (data is null) return;
 
             var now = DateTime.UtcNow;
