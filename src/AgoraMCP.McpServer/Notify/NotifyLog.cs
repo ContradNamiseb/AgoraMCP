@@ -16,17 +16,35 @@ public static class NotifyLog
     private static readonly string BuildVersion =
         Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "0.0.0";
 
-    public static string DefaultLogPath
+    public static string DefaultLogPath => LogPathForDb(null);
+
+    /// <summary>
+    /// Resolves the structured notification log path. Honors <c>AGORA_NOTIFY_LOG</c>
+    /// (<c>off</c>/<c>none</c> disables logging; any other value is used directly).
+    /// Otherwise logs beside <paramref name="dbPath"/> (<c>&lt;dbDir&gt;/logs/notify.log</c>)
+    /// so temporary/isolated <c>--db</c> runs never pollute the default live log,
+    /// while the default DB still logs to <c>%LOCALAPPDATA%\AgoraMCP\logs\notify.log</c>.
+    /// </summary>
+    public static string LogPathForDb(string? dbPath)
     {
-        get
+        var env = Environment.GetEnvironmentVariable("AGORA_NOTIFY_LOG");
+        if (!string.IsNullOrWhiteSpace(env))
+            return env.Trim();
+
+        if (!string.IsNullOrWhiteSpace(dbPath) && !dbPath.Equals(":memory:", StringComparison.OrdinalIgnoreCase))
         {
-            var env = Environment.GetEnvironmentVariable("AGORA_NOTIFY_LOG");
-            if (!string.IsNullOrWhiteSpace(env))
-                return env.Trim();
-            var localApp = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-            var root = string.IsNullOrWhiteSpace(localApp) ? Path.GetTempPath() : localApp;
-            return Path.Combine(root, "AgoraMCP", "logs", "notify.log");
+            try
+            {
+                var dir = Path.GetDirectoryName(Path.GetFullPath(dbPath));
+                if (!string.IsNullOrEmpty(dir))
+                    return Path.Combine(dir, "logs", "notify.log");
+            }
+            catch { }
         }
+
+        var localApp = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        var root = string.IsNullOrWhiteSpace(localApp) ? Path.GetTempPath() : localApp;
+        return Path.Combine(root, "AgoraMCP", "logs", "notify.log");
     }
 
     public static void Write(
@@ -35,11 +53,12 @@ public static class NotifyLog
         string reason,
         long? cursor = null,
         long? turnCursor = null,
-        string? logPath = null)
+        string? logPath = null,
+        string? dbPath = null)
     {
         try
         {
-            var path = string.IsNullOrWhiteSpace(logPath) ? DefaultLogPath : logPath!;
+            var path = !string.IsNullOrWhiteSpace(logPath) ? logPath! : LogPathForDb(dbPath);
             if (path.Equals("off", StringComparison.OrdinalIgnoreCase) ||
                 path.Equals("none", StringComparison.OrdinalIgnoreCase))
             {

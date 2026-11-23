@@ -33,7 +33,7 @@ public static class PresenceStore
         if (string.IsNullOrWhiteSpace(agent))
             throw new AgoraException("heartbeat needs an agent name — presence is per-agent identity.");
 
-        agent = agent.Trim();
+        agent = AgentIdentity.ValidateName(agent, "agent");
         specialty = specialty.Trim();
         capabilities = capabilities.Trim();
         var seen = (at ?? DateTimeOffset.UtcNow).UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'");

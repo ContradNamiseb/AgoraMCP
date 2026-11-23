@@ -30,7 +30,8 @@ public static class HookCheck
     public const int MaxTotalCharsPerBatch = 8000;
     public const int MaxBodyCharsPerEvent = 3000;
     public const int MaxTopicChars = 80;
-    public const int StdinReadTimeoutMs = 250;
+    public const int MaxAuthorChars = 64;
+    public const int StdinReadTimeoutMs = 1500;
     public const int MaxStdinBytes = 256 * 1024;
 
     public sealed record Options
@@ -108,6 +109,14 @@ public static class HookCheck
             "sessions",
             $"{AgentFileKey(agent)}.json");
 
+    /// <summary>Legacy pre-L7 session beacon path for seamless upgrade fallback.</summary>
+    internal static string LegacySessionPath(string agent) =>
+        Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "AgoraMCP",
+            "sessions",
+            $"{SanitizeFileSegment(agent)}.json");
+
     public static string SanitizeFileSegment(string value)
     {
         var trimmed = (value ?? "").Trim().ToLowerInvariant();
@@ -139,9 +148,11 @@ public static class HookCheck
         var @out = stdout ?? Console.Out;
         var err = stderr ?? Console.Error;
 
+        var dbPath = Path.GetFullPath(options.DbPath);
+
         try
         {
-            var payload = ReadStdinPayload(stdin);
+            var payload = ReadStdinPayload(stdin, options.Format);
 
             // I3: subagents never consume or inject parent-agent Agora DMs.
             if (payload.IsSubagent)
@@ -163,7 +174,6 @@ public static class HookCheck
                 }
             }
 
-            var dbPath = Path.GetFullPath(options.DbPath);
             if (!File.Exists(dbPath))
                 return 0;
 
@@ -176,8 +186,18 @@ public static class HookCheck
             using var stateLock = AcquireStateLock(statePath);
             if (stateLock is null)
             {
-                NotifyLog.Write("hook-check", agent, "lock busy; skipped to avoid duplicate delivery");
+                NotifyLog.Write("hook-check", agent, "lock busy; skipped to avoid duplicate delivery", dbPath: dbPath);
                 return 0;
+            }
+
+            var isFirstSessionSeen = !File.Exists(statePath);
+            if (isFirstSessionSeen && payload.KeyNames.Count > 0)
+            {
+                NotifyLog.Write(
+                    "hook-check",
+                    agent,
+                    $"format={options.Format} stdin_keys=[{string.Join(",", payload.KeyNames)}]",
+                    dbPath: dbPath);
             }
 
             var state = LoadState(statePath);
@@ -272,7 +292,7 @@ public static class HookCheck
                     || (payload.LoopCount is int lc && lc >= maxBlocks);
                 if (hitGuard)
                 {
-                    NotifyLog.Write("hook-check", agent, $"stop latch active ({effectiveState.ConsecutiveBlocks}/{maxBlocks}); yielding", cursor, turnCursor);
+                    NotifyLog.Write("hook-check", agent, $"stop latch active ({effectiveState.ConsecutiveBlocks}/{maxBlocks}); yielding", cursor, turnCursor, dbPath: dbPath);
                     return 0;
                 }
 
@@ -287,7 +307,7 @@ public static class HookCheck
                     WriteJsonAtomic(statePath, effectiveState);
                 }
 
-                NotifyLog.Write("hook-check", agent, $"stop blocked with {events.Count} event(s) (block {effectiveState.ConsecutiveBlocks}/{maxBlocks})", newMaxSeq, newMaxTurnSeq);
+                NotifyLog.Write("hook-check", agent, $"stop blocked with {events.Count} event(s) (block {effectiveState.ConsecutiveBlocks}/{maxBlocks})", newMaxSeq, newMaxTurnSeq, dbPath: dbPath);
                 return exitCode;
             }
             else
@@ -308,7 +328,7 @@ public static class HookCheck
         }
         catch (Exception e)
         {
-            NotifyLog.Write("hook-check", agent, $"fail-silent error: {e.Message}");
+            NotifyLog.Write("hook-check", agent, $"fail-silent error: {e.Message}", dbPath: dbPath);
             return 0;
         }
     }
@@ -396,14 +416,21 @@ public static class HookCheck
         return text[..maxChars];
     }
 
-    public static string SanitizeIdentifier(string? value, string fallback)
+    public static string SanitizeIdentifier(string? value, string fallback, int maxChars = MaxAuthorChars)
     {
         var trimmed = (value ?? "").Trim();
         if (trimmed.Length == 0) return fallback;
-        var sb = new StringBuilder(trimmed.Length);
+        var limit = Math.Max(1, maxChars);
+        var sb = new StringBuilder(Math.Min(trimmed.Length, limit));
         foreach (var ch in trimmed)
         {
-            if (char.IsLetterOrDigit(ch) || ch is '-' or '_' or '.') sb.Append(ch);
+            // ASCII identifier chars only so non-ASCII lookalikes or unbounded names
+            // cannot escape or bloat headers outside the peer nonce frame.
+            if (ch is (>= 'a' and <= 'z') or (>= 'A' and <= 'Z') or (>= '0' and <= '9') or '-' or '_' or '.')
+            {
+                sb.Append(ch);
+                if (sb.Length >= limit) break;
+            }
         }
         return sb.Length > 0 ? sb.ToString() : fallback;
     }
@@ -475,9 +502,7 @@ public static class HookCheck
         var lines = normalized.Split('\n');
         for (var i = 0; i < lines.Length; i++)
         {
-            var t = lines[i].TrimStart();
-            if (t.StartsWith("[Agora ", StringComparison.OrdinalIgnoreCase) ||
-                t.StartsWith("[Agora\t", StringComparison.OrdinalIgnoreCase))
+            if (LooksLikeSpoofedAgoraHeader(lines[i]))
             {
                 lines[i] = "> " + lines[i];
             }
@@ -485,18 +510,50 @@ public static class HookCheck
         return string.Join("\n", lines);
     }
 
+    private static bool LooksLikeSpoofedAgoraHeader(string line)
+    {
+        // Map Unicode Zs space separators (e.g. U+00A0 NBSP, U+3000 ideographic space)
+        // and tabs to ASCII ' ' and fold fullwidth '[' (U+FF3B) / ']' (U+FF3D) so
+        // lookalike spoofed "[Agora ..." headers cannot evade quoting (L8).
+        var sb = new StringBuilder(Math.Min(line.Length, 16));
+        var leading = true;
+        foreach (var ch in line)
+        {
+            var isSpace = ch is ' ' or '\t' || CharUnicodeInfo.GetUnicodeCategory(ch) == UnicodeCategory.SpaceSeparator;
+            if (leading && isSpace) continue;
+            leading = false;
+            if (isSpace) sb.Append(' ');
+            else if (ch == '\uFF3B') sb.Append('[');
+            else if (ch == '\uFF3D') sb.Append(']');
+            else sb.Append(ch);
+            if (sb.Length >= 8) break;
+        }
+        if (sb.Length < 6) return false;
+        var head = sb.ToString();
+        if (!head.StartsWith("[Agora", StringComparison.OrdinalIgnoreCase)) return false;
+        if (head.Length == 6) return true;
+        return head[6] is ' ' or ']';
+    }
+
     private static List<BoardEvent> CapJsonEvents(IReadOnlyList<BoardEvent> events)
     {
-        // L9: enforce event count and total body char caps on --format json too.
+        // L9: enforce event count and exact total body char caps on --format json too.
         var list = new List<BoardEvent>(Math.Min(events.Count, MaxEventsPerBatch));
         var remaining = MaxTotalCharsPerBatch;
         foreach (var ev in events)
         {
             if (list.Count >= MaxEventsPerBatch || remaining <= 0) break;
             var cap = Math.Min(MaxBodyCharsPerEvent, remaining);
-            var body = ev.Body.Length > cap ? SafeSubstring(ev.Body, cap) + "…" : ev.Body;
-            var topic = SanitizeInline(ev.Topic, ev.Topic, MaxTopicChars);
-            list.Add(ev with { Body = body, Topic = topic });
+            string body;
+            if (ev.Body.Length <= cap)
+                body = ev.Body;
+            else if (cap > 1)
+                body = SafeSubstring(ev.Body, cap - 1) + "…";
+            else
+                body = SafeSubstring(ev.Body, cap);
+            var topic = SanitizeInline(ev.Topic, "", MaxTopicChars);
+            var author = SanitizeIdentifier(ev.Author, "peer");
+            list.Add(ev with { Body = body, Topic = topic, Author = author });
             remaining -= body.Length;
         }
         return list;
@@ -637,9 +694,13 @@ public static class HookCheck
         string? Prompt,
         bool StopHookActive,
         int? LoopCount,
-        bool IsSubagent);
+        bool IsSubagent,
+        IReadOnlyList<string> KeyNames);
 
-    private static StdinPayload ReadStdinPayload(TextReader? stdin)
+    private static StdinPayload EmptyPayload() =>
+        new(null, null, null, null, false, null, false, []);
+
+    private static StdinPayload ReadStdinPayload(TextReader? stdin, string format)
     {
         string raw;
         try
@@ -650,29 +711,36 @@ public static class HookCheck
             }
             else if (Console.IsInputRedirected)
             {
-                // I8: bounded read timeout so an unclosed stdin pipe never hangs a hook.
+                // I8: bounded read timeout (1.5s) with early exit as soon as JSON parses.
                 raw = ReadRedirectedStdinBounded(TimeSpan.FromMilliseconds(StdinReadTimeoutMs), MaxStdinBytes);
             }
             else
             {
-                return new StdinPayload(null, null, null, null, false, null, false);
+                return EmptyPayload();
             }
         }
         catch
         {
-            return new StdinPayload(null, null, null, null, false, null, false);
+            return EmptyPayload();
         }
 
+        // Strip UTF-8 BOM if present (e.g. Windows shell-piped JSON in Cursor).
+        raw = raw.TrimStart('\uFEFF');
         if (string.IsNullOrWhiteSpace(raw))
-            return new StdinPayload(null, null, null, null, false, null, false);
+            return EmptyPayload();
 
         try
         {
             using var doc = JsonDocument.Parse(raw);
             if (doc.RootElement.ValueKind != JsonValueKind.Object)
-                return new StdinPayload(null, null, null, null, false, null, false);
+                return EmptyPayload();
 
             var root = doc.RootElement;
+            var keyNames = new List<string>();
+            foreach (var prop in root.EnumerateObject())
+                keyNames.Add(prop.Name);
+            keyNames.Sort(StringComparer.Ordinal);
+
             var eventName = FirstString(root, "hook_event_name", "hookEventName", "event", "event_name");
             var sessionId = FirstString(root,
                 "session_id", "sessionId",
@@ -682,15 +750,53 @@ public static class HookCheck
             var prompt = FirstString(root, "prompt", "user_prompt", "message");
             var stopHookActive = FirstBool(root, "stop_hook_active", "stopHookActive");
             var loopCount = FirstInt(root, "loop_count", "loopCount");
-            var isSubagent = FirstBool(root, "is_subagent", "isSubagent")
-                || !string.IsNullOrWhiteSpace(FirstString(root, "agent_id", "agentId", "parent_session_id", "parentSessionId"));
+            var isSubagent = DetectSubagent(root, eventName, format);
 
-            return new StdinPayload(eventName, sessionId, cwd, prompt, stopHookActive, loopCount, isSubagent);
+            return new StdinPayload(eventName, sessionId, cwd, prompt, stopHookActive, loopCount, isSubagent, keyNames);
         }
         catch (JsonException)
         {
-            return new StdinPayload(null, null, null, null, false, null, false);
+            return EmptyPayload();
         }
+    }
+
+    private static bool DetectSubagent(JsonElement root, string? eventName, string format)
+    {
+        // Explicit subagent boolean takes precedence (e.g. ZCode sends "agent_id":"main","subagent":false).
+        var explicitFlag = FirstNullableBool(root, "is_subagent", "isSubagent", "subagent", "is_sub_agent");
+        if (explicitFlag.HasValue)
+            return explicitFlag.Value;
+
+        // Explicit subagent lifecycle events are always subagents.
+        var evNorm = (eventName ?? "").Trim().ToLowerInvariant();
+        if (evNorm.StartsWith("subagent", StringComparison.Ordinal))
+            return true;
+
+        // Explicit parent session/conversation/agent links always indicate a child subagent.
+        if (!string.IsNullOrWhiteSpace(FirstString(root,
+                "parent_session_id", "parentSessionId",
+                "parent_conversation_id", "parentConversationId",
+                "parent_agent_id", "parentAgentId")))
+        {
+            return true;
+        }
+
+        // Cursor and Copilot CLI include agent_id on main-session hooks too, so only
+        // treat bare agent_id as a subagent indicator for formats where main sessions
+        // omit it (Claude/Codex/Kimi/standard) and ignore default/main labels.
+        var fmt = (format ?? "").Trim().ToLowerInvariant();
+        if (fmt is "cursor" or "copilot")
+            return false;
+
+        var agentId = FirstString(root, "agent_id", "agentId");
+        if (string.IsNullOrWhiteSpace(agentId))
+            return false;
+
+        var idNorm = agentId.Trim().ToLowerInvariant();
+        if (idNorm is "main" or "default" or "default-agent" or "primary" or "root")
+            return false;
+
+        return true;
     }
 
     internal static string ReadRedirectedStdinBounded(TimeSpan timeout, int maxBytes)
@@ -707,7 +813,16 @@ public static class HookCheck
                     var want = (int)Math.Min(buf.Length, maxBytes - ms.Length);
                     var n = stream.Read(buf, 0, want);
                     if (n <= 0) break;
-                    lock (ms) ms.Write(buf, 0, n);
+                    byte[] snapshot;
+                    lock (ms)
+                    {
+                        ms.Write(buf, 0, n);
+                        snapshot = ms.ToArray();
+                    }
+                    // Stop as soon as a complete JSON object has been received so
+                    // clients that keep stdin open don't stall for the full timeout.
+                    if (LooksLikeCompleteJsonObject(snapshot))
+                        break;
                 }
             }
             catch { }
@@ -717,6 +832,29 @@ public static class HookCheck
         byte[] bytes;
         lock (ms) bytes = ms.ToArray();
         return bytes.Length == 0 ? "" : Encoding.UTF8.GetString(bytes);
+    }
+
+    private static bool LooksLikeCompleteJsonObject(byte[] utf8Bytes)
+    {
+        var end = utf8Bytes.Length - 1;
+        while (end >= 0 && utf8Bytes[end] is (byte)' ' or (byte)'\t' or (byte)'\r' or (byte)'\n')
+            end -= 1;
+        if (end < 1 || utf8Bytes[end] != (byte)'}')
+            return false;
+        try
+        {
+            var span = utf8Bytes.AsSpan(0, end + 1);
+            if (span.Length >= 3 && span[0] == 0xEF && span[1] == 0xBB && span[2] == 0xBF)
+                span = span[3..];
+            var reader = new Utf8JsonReader(span);
+            return JsonDocument.TryParseValue(ref reader, out var doc) && doc is not null && DisposeAndTrue(doc);
+        }
+        catch
+        {
+            return false;
+        }
+
+        static bool DisposeAndTrue(JsonDocument d) { d.Dispose(); return true; }
     }
 
     private static string? FirstString(JsonElement obj, params string[] names)
@@ -732,15 +870,18 @@ public static class HookCheck
         return null;
     }
 
-    private static bool FirstBool(JsonElement obj, params string[] names)
+    private static bool? FirstNullableBool(JsonElement obj, params string[] names)
     {
         foreach (var name in names)
         {
             if (obj.TryGetProperty(name, out var prop) && prop.ValueKind is JsonValueKind.True or JsonValueKind.False)
                 return prop.GetBoolean();
         }
-        return false;
+        return null;
     }
+
+    private static bool FirstBool(JsonElement obj, params string[] names) =>
+        FirstNullableBool(obj, names) ?? false;
 
     private static int? FirstInt(JsonElement obj, params string[] names)
     {
@@ -805,8 +946,9 @@ public static class HookCheck
             var exactName = $"hook-{agentKey}.json";
             var sessionPrefix = $"hook-{agentKey}-";
             var cutoff = DateTime.UtcNow - maxAge;
+            var di = new DirectoryInfo(dir);
 
-            var newest = new DirectoryInfo(dir)
+            var newest = di
                 .EnumerateFiles($"hook-{agentKey}*.json")
                 .Where(f =>
                     (f.Name.Equals(exactName, StringComparison.OrdinalIgnoreCase) ||
@@ -814,12 +956,47 @@ public static class HookCheck
                     f.LastWriteTimeUtc >= cutoff)
                 .OrderByDescending(f => f.LastWriteTimeUtc)
                 .FirstOrDefault();
-            return newest is null ? null : LoadState(newest.FullName);
+            if (newest is not null)
+                return LoadState(newest.FullName);
+
+            // Upgrade continuity: fall back to legacy pre-L7 filenames strictly matching
+            // hook-<slug>.json or hook-<slug>-<12hex>.json (exact 12-hex suffix keeps
+            // "claude" completely separate from "claude-code").
+            var slug = SanitizeFileSegment(agent);
+            var legacyNewest = di
+                .EnumerateFiles($"hook-{slug}*.json")
+                .Where(f => IsLegacyAgentStateFileName(f.Name, slug) && f.LastWriteTimeUtc >= cutoff)
+                .OrderByDescending(f => f.LastWriteTimeUtc)
+                .FirstOrDefault();
+            return legacyNewest is null ? null : LoadState(legacyNewest.FullName);
         }
         catch
         {
             return null;
         }
+    }
+
+    internal static bool IsLegacyAgentStateFileName(string fileName, string slug)
+    {
+        var exact = $"hook-{slug}.json";
+        if (fileName.Equals(exact, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        var prefix = $"hook-{slug}-";
+        const string suffix = ".json";
+        if (!fileName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) ||
+            !fileName.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+        var mid = fileName[prefix.Length..^suffix.Length];
+        if (mid.Length != 12) return false;
+        foreach (var ch in mid)
+        {
+            if (ch is not ((>= '0' and <= '9') or (>= 'a' and <= 'f') or (>= 'A' and <= 'F')))
+                return false;
+        }
+        return true;
     }
 
     internal static HookState? LoadState(string path)

@@ -92,7 +92,9 @@ public static class TurnStore
             throw new AgoraException("turn: every pass names the passing agent.");
         if (toAgent.Trim().Length == 0)
             throw new AgoraException("turn: every pass names the receiving agent.");
-        if (toAgent.Trim() == fromAgent.Trim())
+        fromAgent = AgentIdentity.ValidateName(fromAgent, "from_agent");
+        toAgent = AgentIdentity.ValidateName(toAgent, "pass_to");
+        if (toAgent == fromAgent)
             throw new AgoraException(
                 $"turn: passing the turn to yourself ({fromAgent}) is meaningless — the holder is unchanged.");
         if (instruction.Trim().Length == 0)

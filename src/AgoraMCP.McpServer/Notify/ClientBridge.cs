@@ -32,6 +32,8 @@ public static class ClientBridge
     public const double DefaultSessionMaxAgeSeconds = 4 * 60 * 60; // 4 hours
     public const double DefaultWakeCooldownSeconds = 60 * 60; // 60 min loop-breaker latch
     public const int DefaultMaxGlobalWakes = 15;
+    /// <summary>Default bounded backoff schedule (5s, 30s, 2m) for transient dispatch failures (I1).</summary>
+    public static readonly double[] DefaultRetryDelaysSeconds = [5.0, 30.0, 120.0];
 
     // M2: never follow HTTP redirects with Authorization headers attached.
     private static readonly HttpClient SharedHttp = new(new SocketsHttpHandler
@@ -83,6 +85,10 @@ public static class ClientBridge
         public double WakeWindowSeconds { get; init; } = 600;
         /// <summary>Latch duration in seconds once a thread or global cap trips.</summary>
         public double WakeCooldownSeconds { get; init; } = DefaultWakeCooldownSeconds;
+        /// <summary>Bounded retry delays (seconds) when resident dispatch fails transiently before advancing cursor (I1).</summary>
+        public IReadOnlyList<double>? RetryDelaysSeconds { get; init; }
+        /// <summary>Optional path for persisting wake-cap / latch state across bridge restarts (defaults beside --db).</summary>
+        public string? CapStatePath { get; init; }
         /// <summary>Exit cleanly if this parent PID exits.</summary>
         public int? ParentPid { get; init; }
         /// <summary>Auto-detect own parent PID on Windows/Linux/macOS and exit cleanly if it terminates.</summary>
@@ -220,10 +226,18 @@ public static class ClientBridge
             var latchedUntil = new Dictionary<long, DateTime>();
             var globalHistory = new Queue<DateTime>();
             DateTime? globalLatchedUntil = null;
+            var capStatePath = ResolveCapStatePath(dbPath, agent, options.CapStatePath);
+            var window = TimeSpan.FromSeconds(Math.Max(1, options.WakeWindowSeconds));
+            var cooldown = TimeSpan.FromSeconds(Math.Max(1, options.WakeCooldownSeconds));
+            LoadPersistedWakeCaps(capStatePath, wakeHistory, latchedUntil, globalHistory, ref globalLatchedUntil, window);
+
+            var retryDelays = options.RetryDelaysSeconds ?? DefaultRetryDelaysSeconds;
+            var retryAttempt = 0;
+            DateTime? retryAfterUtc = null;
 
             err.WriteLine($"bridge: watching '{agent}' for client '{client}' (cursor={cursor}, turn={turnCursor}, db={dbPath}{(options.DryRun ? ", dry-run" : "")})");
             err.Flush();
-            NotifyLog.Write($"bridge:{client}", agent, "started", cursor, turnCursor);
+            NotifyLog.Write($"bridge:{client}", agent, "started", cursor, turnCursor, dbPath: dbPath);
 
             var firstPass = true;
             while (!linkedToken.IsCancellationRequested)
@@ -233,16 +247,39 @@ public static class ClientBridge
                     if (watchedParent is not null && BoardTail.SafeHasExited(watchedParent))
                         return 0;
 
-                    var wait = fallback;
+                    TimeSpan wait;
+                    var waitingForBackoff = retryAfterUtc is not null;
+                    if (retryAfterUtc is DateTime ra)
+                    {
+                        wait = ra - DateTime.UtcNow;
+                        if (wait < TimeSpan.Zero) wait = TimeSpan.Zero;
+                    }
+                    else
+                    {
+                        wait = fallback;
+                    }
+
                     if (deadline is { } dl)
                     {
                         var remaining = dl - DateTime.UtcNow;
                         if (remaining <= TimeSpan.Zero) return 0;
                         if (remaining < wait) wait = remaining;
                     }
+
                     try
                     {
-                        await ChannelBridge.WaitForWakeAsync(ownEvent, wait, linkedToken);
+                        if (waitingForBackoff)
+                        {
+                            // Wait strictly for bounded retry backoff so unrelated board
+                            // broadcasts don't spin-retry a down local client server.
+                            if (wait > TimeSpan.Zero)
+                                await Task.Delay(wait, linkedToken);
+                            retryAfterUtc = null;
+                        }
+                        else
+                        {
+                            await ChannelBridge.WaitForWakeAsync(ownEvent, wait, linkedToken);
+                        }
                     }
                     catch (OperationCanceledException)
                     {
@@ -254,6 +291,8 @@ public static class ClientBridge
                 if (watchedParent is not null && BoardTail.SafeHasExited(watchedParent))
                     return 0;
 
+                long pendingMaxSeq = cursor;
+                long pendingMaxTurnSeq = turnCursor;
                 try
                 {
                     var (events, maxSeq, maxTurnSeq) = NotifyHub.ReadCombinedSince(
@@ -264,16 +303,17 @@ public static class ClientBridge
                         directedOnly: !options.IncludeAll,
                         dmsOnly: options.DmsOnly,
                         excludeSelf: true);
+                    pendingMaxSeq = maxSeq;
+                    pendingMaxTurnSeq = maxTurnSeq;
 
                     if (events.Count == 0)
                     {
+                        retryAttempt = 0;
+                        retryAfterUtc = null;
                         if (maxSeq > cursor) cursor = maxSeq;
                         if (maxTurnSeq > turnCursor) turnCursor = maxTurnSeq;
                         continue;
                     }
-
-                    var window = TimeSpan.FromSeconds(Math.Max(1, options.WakeWindowSeconds));
-                    var cooldown = TimeSpan.FromSeconds(Math.Max(1, options.WakeCooldownSeconds));
 
                     // Global loop breaker (I4)
                     if (options.MaxGlobalWakes > 0 && globalLatchedUntil is DateTime gUntil)
@@ -283,19 +323,25 @@ public static class ClientBridge
                             var remMin = Math.Max(1, (int)Math.Ceiling((gUntil - DateTime.UtcNow).TotalMinutes));
                             err.WriteLine($"bridge [{client}]: global wake cap cooldown active ({remMin}m left); leaving {events.Count} event(s) in pending queries.");
                             err.Flush();
-                            NotifyLog.Write($"bridge:{client}", agent, $"global cooldown active ({remMin}m left)", maxSeq, maxTurnSeq);
+                            NotifyLog.Write($"bridge:{client}", agent, $"global cooldown active ({remMin}m left)", maxSeq, maxTurnSeq, dbPath: dbPath);
+                            retryAttempt = 0;
+                            retryAfterUtc = null;
                             if (maxSeq > cursor) cursor = maxSeq;
                             if (maxTurnSeq > turnCursor) turnCursor = maxTurnSeq;
                             if (options.Once) return 0;
                             continue;
                         }
                         globalLatchedUntil = null;
+                        SavePersistedWakeCaps(capStatePath, wakeHistory, latchedUntil, globalHistory, globalLatchedUntil);
                     }
 
                     var deliverable = FilterByWakeCap(
-                        events, wakeHistory, latchedUntil, options.MaxWakesPerThread, window, cooldown, err, client, agent);
+                        events, wakeHistory, latchedUntil, options.MaxWakesPerThread, window, cooldown, err, client, agent, dbPath);
                     if (deliverable.Count == 0)
                     {
+                        SavePersistedWakeCaps(capStatePath, wakeHistory, latchedUntil, globalHistory, globalLatchedUntil);
+                        retryAttempt = 0;
+                        retryAfterUtc = null;
                         if (maxSeq > cursor) cursor = maxSeq;
                         if (maxTurnSeq > turnCursor) turnCursor = maxTurnSeq;
                         if (options.Once) return 0;
@@ -308,7 +354,9 @@ public static class ClientBridge
                     {
                         err.WriteLine($"bridge [{client}]: skipped — {sessionError}; mail stays in pending queries.");
                         err.Flush();
-                        NotifyLog.Write($"bridge:{client}", agent, $"skipped: {sessionError}", maxSeq, maxTurnSeq);
+                        NotifyLog.Write($"bridge:{client}", agent, $"skipped: {sessionError}", maxSeq, maxTurnSeq, dbPath: dbPath);
+                        retryAttempt = 0;
+                        retryAfterUtc = null;
                         if (maxSeq > cursor) cursor = maxSeq;
                         if (maxTurnSeq > turnCursor) turnCursor = maxTurnSeq;
                         if (options.Once) return 1;
@@ -317,7 +365,8 @@ public static class ClientBridge
 
                     var req = new DispatchRequest(client, agent, sessionId ?? "", message, deliverable);
 
-                    // I1: dispatch BEFORE advancing cursors; retry once on transient failure in resident mode.
+                    // I1: dispatch BEFORE advancing cursors; hold cursor with bounded backoff
+                    // (default 5s, 30s, 2m) on transient failure before advancing and logging.
                     DispatchResult res;
                     if (options.DryRun)
                     {
@@ -328,41 +377,75 @@ public static class ClientBridge
                     }
                     else
                     {
-                        Func<Task<DispatchResult>> runOnce = dispatcher is not null
-                            ? () => dispatcher(req, linkedToken)
-                            : () => DispatchAsync(req, options, linkedToken);
-
-                        res = await runOnce();
-                        if (!res.Ok && !options.Once && dispatcher is null && !linkedToken.IsCancellationRequested)
-                        {
-                            try { await Task.Delay(500, linkedToken); }
-                            catch (OperationCanceledException) { return 0; }
-                            res = await runOnce();
-                        }
+                        res = dispatcher is not null
+                            ? await dispatcher(req, linkedToken)
+                            : await DispatchAsync(req, options, linkedToken);
                     }
 
                     if (res.Ok)
                     {
+                        retryAttempt = 0;
+                        retryAfterUtc = null;
                         RecordSuccessfulWake(
                             deliverable, wakeHistory, latchedUntil, globalHistory, ref globalLatchedUntil,
                             options.MaxWakesPerThread, options.MaxGlobalWakes, window, cooldown);
+                        SavePersistedWakeCaps(capStatePath, wakeHistory, latchedUntil, globalHistory, globalLatchedUntil);
+                        if (maxSeq > cursor) cursor = maxSeq;
+                        if (maxTurnSeq > turnCursor) turnCursor = maxTurnSeq;
+                        err.WriteLine($"bridge [{client}]: ok — {res.Detail}");
+                        err.Flush();
+                        NotifyLog.Write($"bridge:{client}", agent, $"ok: {res.Detail}", cursor, turnCursor, dbPath: dbPath);
+                        if (options.Once) return 0;
                     }
-
-                    if (maxSeq > cursor) cursor = maxSeq;
-                    if (maxTurnSeq > turnCursor) turnCursor = maxTurnSeq;
-
-                    err.WriteLine($"bridge [{client}]: {(res.Ok ? "ok" : "warn")} — {res.Detail}");
-                    err.Flush();
-                    NotifyLog.Write($"bridge:{client}", agent, $"{(res.Ok ? "ok" : "warn")}: {res.Detail}", cursor, turnCursor);
-
-                    if (options.Once) return res.Ok ? 0 : 1;
+                    else if (!options.Once && retryAttempt < retryDelays.Count)
+                    {
+                        var delaySec = Math.Max(0.01, retryDelays[retryAttempt]);
+                        retryAttempt += 1;
+                        retryAfterUtc = DateTime.UtcNow.AddSeconds(delaySec);
+                        err.WriteLine($"bridge [{client}]: warn — {res.Detail}; holding cursor (retry {retryAttempt}/{retryDelays.Count} in {delaySec:0.##}s).");
+                        err.Flush();
+                        NotifyLog.Write($"bridge:{client}", agent, $"warn (retry {retryAttempt}/{retryDelays.Count} in {delaySec:0.##}s): {res.Detail}", cursor, turnCursor, dbPath: dbPath);
+                    }
+                    else
+                    {
+                        retryAttempt = 0;
+                        retryAfterUtc = null;
+                        if (maxSeq > cursor) cursor = maxSeq;
+                        if (maxTurnSeq > turnCursor) turnCursor = maxTurnSeq;
+                        err.WriteLine($"bridge [{client}]: warn — {res.Detail}; retries exhausted, advancing cursor (mail stays in pending queries).");
+                        err.Flush();
+                        NotifyLog.Write($"bridge:{client}", agent, $"warn (retries exhausted; advancing): {res.Detail}", cursor, turnCursor, dbPath: dbPath);
+                        if (options.Once) return 1;
+                    }
                 }
                 catch (Exception e) when (e is not OperationCanceledException)
                 {
-                    err.WriteLine($"bridge [{client}]: error ({e.Message}) — {(options.Once ? "aborting (--once)." : "continuing.")}");
-                    err.Flush();
-                    NotifyLog.Write($"bridge:{client}", agent, $"error: {e.Message}", cursor, turnCursor);
-                    if (options.Once) return 1;
+                    if (options.Once)
+                    {
+                        err.WriteLine($"bridge [{client}]: error ({e.Message}) — aborting (--once).");
+                        err.Flush();
+                        NotifyLog.Write($"bridge:{client}", agent, $"error: {e.Message}", cursor, turnCursor, dbPath: dbPath);
+                        return 1;
+                    }
+                    if (retryAttempt < retryDelays.Count)
+                    {
+                        var delaySec = Math.Max(0.01, retryDelays[retryAttempt]);
+                        retryAttempt += 1;
+                        retryAfterUtc = DateTime.UtcNow.AddSeconds(delaySec);
+                        err.WriteLine($"bridge [{client}]: error ({e.Message}) — holding cursor (retry {retryAttempt}/{retryDelays.Count} in {delaySec:0.##}s).");
+                        err.Flush();
+                        NotifyLog.Write($"bridge:{client}", agent, $"error (retry {retryAttempt}/{retryDelays.Count} in {delaySec:0.##}s): {e.Message}", cursor, turnCursor, dbPath: dbPath);
+                    }
+                    else
+                    {
+                        retryAttempt = 0;
+                        retryAfterUtc = null;
+                        if (pendingMaxSeq > cursor) cursor = pendingMaxSeq;
+                        if (pendingMaxTurnSeq > turnCursor) turnCursor = pendingMaxTurnSeq;
+                        err.WriteLine($"bridge [{client}]: error ({e.Message}) — retries exhausted, advancing cursor (mail stays in pending queries).");
+                        err.Flush();
+                        NotifyLog.Write($"bridge:{client}", agent, $"error (retries exhausted; advancing): {e.Message}", cursor, turnCursor, dbPath: dbPath);
+                    }
                 }
 
                 if (deadline is { } dlAfter && DateTime.UtcNow >= dlAfter)
@@ -397,18 +480,35 @@ public static class ClientBridge
                 : (null, $"invalid --session value '{explicitId}' (must not start with '-' or contain whitespace/control chars)");
         }
 
-        var sessionFile = string.IsNullOrWhiteSpace(options.SessionFilePath)
-            ? HookCheck.DefaultSessionPath(agent)
-            : options.SessionFilePath!;
+        var explicitBeaconPath = !string.IsNullOrWhiteSpace(options.SessionFilePath);
+        var sessionFile = explicitBeaconPath
+            ? options.SessionFilePath!
+            : HookCheck.DefaultSessionPath(agent);
+
+        var usedLegacyBeacon = false;
         if (!File.Exists(sessionFile))
         {
-            return (null, $"no active session beacon at '{sessionFile}' (pass --session or enable --record-session hooks)");
+            if (!explicitBeaconPath)
+            {
+                var legacy = HookCheck.LegacySessionPath(agent);
+                if (File.Exists(legacy))
+                {
+                    sessionFile = legacy;
+                    usedLegacyBeacon = true;
+                }
+            }
+            if (!File.Exists(sessionFile))
+                return (null, $"no active session beacon at '{sessionFile}' (pass --session or enable --record-session hooks)");
         }
 
         var beacon = HookCheck.LoadSessionBeacon(sessionFile);
         if (beacon is null || !IsSafeSessionId(beacon.SessionId))
         {
             return (null, $"session beacon '{sessionFile}' has no valid session_id");
+        }
+        if (usedLegacyBeacon && !AgentIdentity.AnswersTo(agent, beacon.Agent))
+        {
+            return (null, $"legacy session beacon '{sessionFile}' belongs to '{beacon.Agent}', not '{agent}'");
         }
 
         if (options.SessionMaxAgeSeconds > 0)
@@ -774,7 +874,8 @@ public static class ClientBridge
         TimeSpan cooldown,
         TextWriter err,
         string client,
-        string agent)
+        string agent,
+        string dbPath)
     {
         if (maxWakes <= 0) return events;
         var now = DateTime.UtcNow;
@@ -798,7 +899,7 @@ public static class ClientBridge
                     err.WriteLine(
                         $"bridge [{client}]: wake cap cooldown active ({remMin}m left) for thread #{ev.ThreadId}; leaving msg #{ev.MsgId} in pending queries.");
                     err.Flush();
-                    NotifyLog.Write($"bridge:{client}", agent, $"thread #{ev.ThreadId} cooldown active ({remMin}m left)", ev.Seq, ev.TurnSeq);
+                    NotifyLog.Write($"bridge:{client}", agent, $"thread #{ev.ThreadId} cooldown active ({remMin}m left)", ev.Seq, ev.TurnSeq, dbPath: dbPath);
                     checkedThreads[ev.ThreadId] = false;
                     continue;
                 }
@@ -815,7 +916,7 @@ public static class ClientBridge
                     err.WriteLine(
                         $"bridge [{client}]: wake cap ({maxWakes}/{window.TotalMinutes:0.#}m) tripped for thread #{ev.ThreadId}; latched for {cooldown.TotalMinutes:0}m, leaving msg #{ev.MsgId} in pending queries.");
                     err.Flush();
-                    NotifyLog.Write($"bridge:{client}", agent, $"thread #{ev.ThreadId} wake cap tripped", ev.Seq, ev.TurnSeq);
+                    NotifyLog.Write($"bridge:{client}", agent, $"thread #{ev.ThreadId} wake cap tripped", ev.Seq, ev.TurnSeq, dbPath: dbPath);
                     checkedThreads[ev.ThreadId] = false;
                     continue;
                 }
@@ -825,6 +926,100 @@ public static class ClientBridge
             allowed.Add(ev);
         }
         return allowed;
+    }
+
+    internal sealed class PersistedWakeCaps
+    {
+        public List<long> GlobalWakesUnixMs { get; set; } = [];
+        public long? GlobalLatchedUntilUnixMs { get; set; }
+        public Dictionary<long, List<long>> ThreadWakesUnixMs { get; set; } = [];
+        public Dictionary<long, long> ThreadLatchedUntilUnixMs { get; set; } = [];
+    }
+
+    internal static string ResolveCapStatePath(string dbPath, string agent, string? explicitPath)
+    {
+        if (!string.IsNullOrWhiteSpace(explicitPath))
+            return explicitPath!;
+        var fullDb = Path.GetFullPath(dbPath);
+        var dbDir = Path.GetDirectoryName(fullDb);
+        var root = string.IsNullOrEmpty(dbDir) ? Path.GetTempPath() : dbDir;
+        var dbKey = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            Encoding.UTF8.GetBytes(OperatingSystem.IsWindows() ? fullDb.ToLowerInvariant() : fullDb)))[..8].ToLowerInvariant();
+        return Path.Combine(root, "bridge-state", $"cap-{dbKey}-{HookCheck.AgentFileKey(agent)}.json");
+    }
+
+    private static void LoadPersistedWakeCaps(
+        string capStatePath,
+        Dictionary<long, Queue<DateTime>> history,
+        Dictionary<long, DateTime> latchedUntil,
+        Queue<DateTime> globalHistory,
+        ref DateTime? globalLatchedUntil,
+        TimeSpan window)
+    {
+        try
+        {
+            if (!File.Exists(capStatePath)) return;
+            var data = JsonSerializer.Deserialize<PersistedWakeCaps>(File.ReadAllText(capStatePath, Encoding.UTF8));
+            if (data is null) return;
+
+            var now = DateTime.UtcNow;
+            var cutoff = now - window;
+
+            if (data.GlobalLatchedUntilUnixMs is long gMs)
+            {
+                var dt = DateTimeOffset.FromUnixTimeMilliseconds(gMs).UtcDateTime;
+                if (dt > now) globalLatchedUntil = dt;
+            }
+            foreach (var ms in data.GlobalWakesUnixMs)
+            {
+                var dt = DateTimeOffset.FromUnixTimeMilliseconds(ms).UtcDateTime;
+                if (dt >= cutoff && dt <= now) globalHistory.Enqueue(dt);
+            }
+            foreach (var (tid, ms) in data.ThreadLatchedUntilUnixMs)
+            {
+                var dt = DateTimeOffset.FromUnixTimeMilliseconds(ms).UtcDateTime;
+                if (dt > now) latchedUntil[tid] = dt;
+            }
+            foreach (var (tid, list) in data.ThreadWakesUnixMs)
+            {
+                var q = new Queue<DateTime>();
+                foreach (var ms in list)
+                {
+                    var dt = DateTimeOffset.FromUnixTimeMilliseconds(ms).UtcDateTime;
+                    if (dt >= cutoff && dt <= now) q.Enqueue(dt);
+                }
+                if (q.Count > 0) history[tid] = q;
+            }
+        }
+        catch { }
+    }
+
+    private static void SavePersistedWakeCaps(
+        string capStatePath,
+        Dictionary<long, Queue<DateTime>> history,
+        Dictionary<long, DateTime> latchedUntil,
+        Queue<DateTime> globalHistory,
+        DateTime? globalLatchedUntil)
+    {
+        try
+        {
+            var now = DateTime.UtcNow;
+            var payload = new PersistedWakeCaps
+            {
+                GlobalWakesUnixMs = globalHistory.Select(d => new DateTimeOffset(d, TimeSpan.Zero).ToUnixTimeMilliseconds()).ToList(),
+                GlobalLatchedUntilUnixMs = globalLatchedUntil is DateTime gd && gd > now
+                    ? new DateTimeOffset(gd, TimeSpan.Zero).ToUnixTimeMilliseconds()
+                    : null,
+                ThreadWakesUnixMs = history
+                    .Where(kv => kv.Value.Count > 0)
+                    .ToDictionary(kv => kv.Key, kv => kv.Value.Select(d => new DateTimeOffset(d, TimeSpan.Zero).ToUnixTimeMilliseconds()).ToList()),
+                ThreadLatchedUntilUnixMs = latchedUntil
+                    .Where(kv => kv.Value > now)
+                    .ToDictionary(kv => kv.Key, kv => new DateTimeOffset(kv.Value, TimeSpan.Zero).ToUnixTimeMilliseconds()),
+            };
+            HookCheck.WriteJsonAtomic(capStatePath, payload);
+        }
+        catch { }
     }
 
     private static void RecordSuccessfulWake(

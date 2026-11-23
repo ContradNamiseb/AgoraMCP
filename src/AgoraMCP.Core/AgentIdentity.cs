@@ -1,3 +1,5 @@
+using AgoraMCP.Database;
+
 namespace AgoraMCP;
 
 /// <summary>
@@ -22,6 +24,38 @@ namespace AgoraMCP;
 /// </summary>
 public static class AgentIdentity
 {
+    /// <summary>Maximum allowed length of an agent name across all writes.</summary>
+    public const int MaxNameLength = 64;
+
+    /// <summary>
+    /// Validates and trims an agent identifier on write (author, to_agent, target_agent,
+    /// pass_to, heartbeat) so oversized or control-character-injected names are rejected
+    /// server-side before hitting SQLite or peer-framing headers.
+    /// </summary>
+    public static string ValidateName(string? raw, string fieldName, bool allowEmpty = false)
+    {
+        var trimmed = (raw ?? "").Trim();
+        if (trimmed.Length == 0)
+        {
+            if (allowEmpty) return "";
+            throw new AgoraException($"{fieldName} must not be empty.");
+        }
+        if (trimmed.Length > MaxNameLength)
+            throw new AgoraException($"{fieldName} exceeds maximum length of {MaxNameLength} characters (got {trimmed.Length}).");
+        foreach (var ch in trimmed)
+        {
+            var cat = System.Globalization.CharUnicodeInfo.GetUnicodeCategory(ch);
+            if (cat is System.Globalization.UnicodeCategory.Control
+                or System.Globalization.UnicodeCategory.Format
+                or System.Globalization.UnicodeCategory.LineSeparator
+                or System.Globalization.UnicodeCategory.ParagraphSeparator)
+            {
+                throw new AgoraException($"{fieldName} must not contain control or line-separator characters.");
+            }
+        }
+        return trimmed;
+    }
+
     /// <summary>Current agent name → the names that preceded it (historical, still routed).</summary>
     private static readonly Dictionary<string, string[]> Former = new(StringComparer.OrdinalIgnoreCase)
     {

@@ -2,13 +2,16 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using AgoraMCP.Database;
 using AgoraMCP.McpServer.Watch;
+using Microsoft.Data.Sqlite;
 
 namespace AgoraMCP.McpServer.Notify;
 
 /// <summary>
-/// Diagnostic health check (`agora doctor [--db PATH]`): reports binary build,
-/// SQLite WAL/schema/migration health, active NamedBoardEvent listeners,
-/// session beacons, per-session hook cursors, and recent `notify.log` entries.
+/// Strictly read-only diagnostic health check (`agora doctor [--db PATH]`):
+/// reports binary build, SQLite WAL/schema/migration health (without mutating
+/// or migrating the DB), active NamedBoardEvent listeners, session beacons,
+/// per-session hook cursors (for the default DB), and recent `notify.log`
+/// entries scoped to `--db`.
 /// </summary>
 public static class Doctor
 {
@@ -16,6 +19,12 @@ public static class Doctor
     {
         var @out = stdout ?? Console.Out;
         var fullDb = Path.GetFullPath(dbPath);
+        var defaultDb = Path.GetFullPath(Config.ResolveDbPath(null));
+        var isDefaultDb = string.Equals(
+            fullDb,
+            defaultDb,
+            OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal);
+
         var ver = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "0.0.0";
         var procPath = Environment.ProcessPath ?? "(unknown)";
 
@@ -32,18 +41,37 @@ public static class Doctor
             try
             {
                 var sizeKb = new FileInfo(fullDb).Length / 1024.0;
-                using var db = AgoraDatabase.Open(fullDb);
+                // Strictly read-only: doctor MUST NOT migrate or create WAL/SHM files.
+                using var db = new SqliteConnection(new SqliteConnectionStringBuilder
+                {
+                    DataSource = fullDb,
+                    Mode = SqliteOpenMode.ReadOnly,
+                    Pooling = false,
+                }.ToString());
+                db.Open();
+
                 var journal = db.Scalar<string>("PRAGMA journal_mode");
                 var userVer = db.Scalar<long>("PRAGMA user_version");
-                var threads = db.Scalar<long>("SELECT COUNT(*) FROM threads");
-                var messages = db.Scalar<long>("SELECT COUNT(*) FROM messages");
-                var turns = db.Scalar<long>("SELECT COUNT(*) FROM turn_events");
-                var zeroAt = db.Scalar<long>("SELECT COUNT(*) FROM turn_events WHERE at_msg_id = 0");
+                var needsMigration = userVer < Migrations.CurrentVersion;
+
+                var hasThreads = TableExists(db, "threads");
+                var hasMessages = TableExists(db, "messages");
+                var hasTurns = TableExists(db, "turn_events");
+
+                var threads = hasThreads ? db.Scalar<long>("SELECT COUNT(*) FROM threads") : 0;
+                var messages = hasMessages ? db.Scalar<long>("SELECT COUNT(*) FROM messages") : 0;
+                var turns = hasTurns ? db.Scalar<long>("SELECT COUNT(*) FROM turn_events") : 0;
+
+                var hasAtMsgCol = hasTurns && ColumnExists(db, "turn_events", "at_msg_id");
+                var zeroAtText = hasAtMsgCol
+                    ? db.Scalar<long>("SELECT COUNT(*) FROM turn_events WHERE at_msg_id = 0").ToString()
+                    : "col-missing";
                 var hasTrig = db.Scalar<long>(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name='trg_turn_events_at_msg_id'") > 0;
 
-                @out.WriteLine($"  db status: OK ({sizeKb:0.0} KB, journal={journal}, user_version={userVer}/{Migrations.CurrentVersion})");
-                @out.WriteLine($"  rows:      threads={threads}, messages={messages}, turn_events={turns} (at_msg_id=0: {zeroAt}, trigger={(hasTrig ? "ok" : "MISSING")})");
+                var statusLabel = needsMigration ? "NEEDS MIGRATION" : "OK";
+                @out.WriteLine($"  db status: {statusLabel} ({sizeKb:0.0} KB, journal={journal}, user_version={userVer}/{Migrations.CurrentVersion})");
+                @out.WriteLine($"  rows:      threads={threads}, messages={messages}, turn_events={turns} (at_msg_id=0: {zeroAtText}, trigger={(hasTrig ? "ok" : "MISSING")})");
             }
             catch (Exception e)
             {
@@ -70,51 +98,58 @@ public static class Doctor
             @out.WriteLine($"  listeners: none ({evDir} not created yet)");
         }
 
-        // Session beacons
-        var sessionsDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "AgoraMCP", "sessions");
-        if (Directory.Exists(sessionsDir))
+        if (!isDefaultDb)
         {
-            var beacons = Directory.GetFiles(sessionsDir, "*.json");
-            @out.WriteLine($"  session beacons ({sessionsDir}): {beacons.Length}");
-            foreach (var b in beacons.Take(10))
+            @out.WriteLine("  session beacons / hook cursors: (skipped — inspecting custom --db)");
+        }
+        else
+        {
+            // Session beacons
+            var sessionsDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "AgoraMCP", "sessions");
+            if (Directory.Exists(sessionsDir))
             {
-                var parsed = HookCheck.LoadSessionBeacon(b);
-                if (parsed is null)
+                var beacons = Directory.GetFiles(sessionsDir, "*.json");
+                @out.WriteLine($"  session beacons ({sessionsDir}): {beacons.Length}");
+                foreach (var b in beacons.Take(10))
                 {
-                    @out.WriteLine($"    - {Path.GetFileName(b)}: unreadable");
-                }
-                else
-                {
-                    var ageNote = DateTimeOffset.TryParse(parsed.UpdatedAt, out var dt)
-                        ? $"{(DateTimeOffset.UtcNow - dt).TotalMinutes:0.0}m ago"
-                        : "missing/invalid updated_at";
-                    @out.WriteLine($"    - {parsed.Agent}: session={parsed.SessionId} ({ageNote})");
+                    var parsed = HookCheck.LoadSessionBeacon(b);
+                    if (parsed is null)
+                    {
+                        @out.WriteLine($"    - {Path.GetFileName(b)}: unreadable");
+                    }
+                    else
+                    {
+                        var ageNote = DateTimeOffset.TryParse(parsed.UpdatedAt, out var dt)
+                            ? $"{(DateTimeOffset.UtcNow - dt).TotalMinutes:0.0}m ago"
+                            : "missing/invalid updated_at";
+                        @out.WriteLine($"    - {parsed.Agent}: session={parsed.SessionId} ({ageNote})");
+                    }
                 }
             }
-        }
-        else
-        {
-            @out.WriteLine("  session beacons: none");
+            else
+            {
+                @out.WriteLine("  session beacons: none");
+            }
+
+            // Hook cursor files
+            var hooksDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "AgoraMCP", "hooks");
+            if (Directory.Exists(hooksDir))
+            {
+                var hookFiles = Directory.GetFiles(hooksDir, "hook-*.json");
+                @out.WriteLine($"  hook cursors ({hooksDir}): {hookFiles.Length} file(s)");
+            }
+            else
+            {
+                @out.WriteLine("  hook cursors: none");
+            }
         }
 
-        // Hook cursor files
-        var hooksDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "AgoraMCP", "hooks");
-        if (Directory.Exists(hooksDir))
-        {
-            var hookFiles = Directory.GetFiles(hooksDir, "hook-*.json");
-            @out.WriteLine($"  hook cursors ({hooksDir}): {hookFiles.Length} file(s)");
-        }
-        else
-        {
-            @out.WriteLine("  hook cursors: none");
-        }
-
-        // Recent notify.log
-        var logPath = NotifyLog.DefaultLogPath;
+        // Recent notify.log scoped to this DB
+        var logPath = NotifyLog.LogPathForDb(fullDb);
         if (logPath.Equals("off", StringComparison.OrdinalIgnoreCase) ||
             logPath.Equals("none", StringComparison.OrdinalIgnoreCase))
         {
@@ -140,6 +175,25 @@ public static class Doctor
         }
 
         return 0;
+    }
+
+    private static bool TableExists(SqliteConnection db, string table) =>
+        db.Prepare("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=$t", "$t")
+            .Set("$t", table)
+            .Query(r => r.GetInt64(0))
+            .FirstOrDefault() > 0;
+
+    private static bool ColumnExists(SqliteConnection db, string table, string column)
+    {
+        using var cmd = db.CreateCommand();
+        cmd.CommandText = $"PRAGMA table_info({table})";
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+        {
+            if (string.Equals(r.GetString(1), column, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
     }
 
     private static bool IsEventLive(string eventFile)

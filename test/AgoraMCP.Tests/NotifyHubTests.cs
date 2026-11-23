@@ -259,6 +259,26 @@ public sealed class NotifyHubTests
             $"GET /events?since=0 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n", cts.Token);
         Assert.Contains("200", ok);
 
+        // Finding #5: while SSE client 1 stays open, client 2 gets 200 OK AND client 3 gets 403 immediately!
+        using var tcp1 = new System.Net.Sockets.TcpClient();
+        await tcp1.ConnectAsync(System.Net.IPAddress.Loopback, port, cts.Token);
+        using var stream1 = tcp1.GetStream();
+        var req1 = System.Text.Encoding.ASCII.GetBytes($"GET /events?since=0 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+        await stream1.WriteAsync(req1, cts.Token);
+        await stream1.FlushAsync(cts.Token);
+        using var reader1 = new StreamReader(stream1, System.Text.Encoding.ASCII, leaveOpen: true);
+        Assert.Contains("200", await reader1.ReadLineAsync(cts.Token) ?? "");
+
+        // Second concurrent SSE client while client 1 is still connected.
+        var ok2 = await SendRawRequestAsync(port,
+            $"GET /events?since=0 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n", cts.Token);
+        Assert.Contains("200", ok2);
+
+        // Third concurrent bad-Host request while client 1 is still connected -> 403 (not hung!).
+        var badWhileConnected = await SendRawRequestAsync(port,
+            "GET /events?since=0 HTTP/1.1\r\nHost: evil.rebind.example:48798\r\n\r\n", cts.Token);
+        Assert.Contains("403", badWhileConnected);
+
         cts.Cancel();
         await hub;
     }

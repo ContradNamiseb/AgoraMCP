@@ -52,6 +52,8 @@ public static class ThreadStore
 
         if (topic.Length == 0) throw new AgoraException("post_question needs a non-empty topic.");
         if (author.Length == 0) throw new AgoraException("every write needs an author — pass the calling agent's name (or set AGORA_AGENT so it is filled in automatically).");
+        author = AgentIdentity.ValidateName(author, "author");
+        directedTo = AgentIdentity.ValidateName(directedTo, "target_agent", allowEmpty: true);
         if (directedTo.Length > 0 && directedTo == author)
             throw new AgoraException($"cannot direct a question at yourself ('{author}'). Leave target_agent empty to ask the agora.");
 
@@ -412,6 +414,7 @@ public static class ThreadStore
         author = (author ?? "").Trim();
         if (body.Length == 0) throw new AgoraException($"a {kind} needs a non-empty body.");
         if (author.Length == 0) throw new AgoraException("every write needs an author — pass the calling agent's name (or set AGORA_AGENT so it is filled in automatically).");
+        author = AgentIdentity.ValidateName(author, "author");
 
         var threadStatus = db.Prepare("SELECT status FROM threads WHERE id = $id", "$id")
             .Set("$id", threadId)

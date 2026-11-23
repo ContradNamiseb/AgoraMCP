@@ -5,7 +5,7 @@
 
 import { execFileSync, spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -16,12 +16,14 @@ const DATA_DIR =
   process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR ||
   join(homedir(), '.gemini', 'antigravity', 'sidecar_data', 'agora-bridge', 'data')
 const ACTIVE_FILE = join(DATA_DIR, 'active.json')
+const CAP_FILE = join(DATA_DIR, 'wake-cap.json')
 
 const ACTIVE_MAX_AGE_MS = parseNonNegativeInt(process.env.AGORA_ACTIVE_MAX_AGE_MS, 4 * 60 * 60 * 1000)
 const MAX_WAKES_PER_THREAD = parseNonNegativeInt(process.env.AGORA_MAX_WAKES_PER_THREAD, 6)
 const MAX_GLOBAL_WAKES = parseNonNegativeInt(process.env.AGORA_MAX_GLOBAL_WAKES, 15)
 const MAX_BODY_CHARS = 3000
 const MAX_TOPIC_CHARS = 80
+const MAX_AUTHOR_CHARS = 64
 const WAKE_WINDOW_MS = 10 * 60 * 1000
 const WAKE_COOLDOWN_MS = 60 * 60 * 1000
 const STABLE_UPTIME_MS = 10 * 1000
@@ -58,6 +60,7 @@ function sanitizeIdentifier(value, fallback) {
   const cleaned = String(value || '')
     .trim()
     .replace(/[^A-Za-z0-9._-]/g, '')
+    .slice(0, MAX_AUTHOR_CHARS)
   return cleaned.length > 0 ? cleaned : fallback
 }
 
@@ -81,9 +84,71 @@ function neutralizePeerBody(body) {
 
   return normalized
     .split('\n')
-    .map((line) => (/^\[Agora[\s\t]/i.test(line.trimStart()) ? '> ' + line : line))
+    .map((line) => {
+      const folded = line
+        .replace(/[\p{Zs}\t]+/gu, ' ')
+        .trimStart()
+        .replace(/^\uFF3B/, '[')
+        .replace(/\uFF3D/g, ']')
+      return /^\[Agora(?:\s|$|\])/i.test(folded) ? '> ' + line : line
+    })
     .join('\n')
 }
+
+function loadPersistedCaps() {
+  try {
+    if (!existsSync(CAP_FILE)) return
+    const data = JSON.parse(readFileSync(CAP_FILE, 'utf-8'))
+    const now = Date.now()
+    const cutoff = now - WAKE_WINDOW_MS
+    if (Array.isArray(data?.globalWakeHistory)) {
+      globalWakeHistory = data.globalWakeHistory.filter((ts) => typeof ts === 'number' && ts >= cutoff && ts <= now)
+    }
+    if (data?.globalLatched && typeof data.globalLatched.until === 'number' && data.globalLatched.until > now) {
+      globalLatched = {
+        until: data.globalLatched.until,
+        activeUpdatedAt: String(data.globalLatched.activeUpdatedAt || ''),
+      }
+    }
+    if (data?.wakeHistory && typeof data.wakeHistory === 'object') {
+      for (const [k, arr] of Object.entries(data.wakeHistory)) {
+        if (Array.isArray(arr)) {
+          const kept = arr.filter((ts) => typeof ts === 'number' && ts >= cutoff && ts <= now)
+          if (kept.length > 0) wakeHistory.set(k, kept)
+        }
+      }
+    }
+    if (data?.latchedThreads && typeof data.latchedThreads === 'object') {
+      for (const [k, v] of Object.entries(data.latchedThreads)) {
+        if (v && typeof v.until === 'number' && v.until > now) {
+          latchedThreads.set(k, { until: v.until, activeUpdatedAt: String(v.activeUpdatedAt || '') })
+        }
+      }
+    }
+  } catch {
+    // Ignore corrupt/missing cap state; start clean.
+  }
+}
+
+function savePersistedCaps() {
+  try {
+    mkdirSync(DATA_DIR, { recursive: true })
+    const now = Date.now()
+    const payload = {
+      globalWakeHistory,
+      globalLatched: globalLatched && globalLatched.until > now ? globalLatched : null,
+      wakeHistory: Object.fromEntries(wakeHistory.entries()),
+      latchedThreads: Object.fromEntries([...latchedThreads.entries()].filter(([, v]) => v && v.until > now)),
+    }
+    const tmp = `${CAP_FILE}.tmp.${process.pid}`
+    writeFileSync(tmp, JSON.stringify(payload), 'utf-8')
+    renameSync(tmp, CAP_FILE)
+  } catch {
+    // Never break sidecar delivery on cap-file write failure.
+  }
+}
+
+loadPersistedCaps()
 
 function allowWakeForThread(threadId, currentActiveUpdatedAt) {
   const now = Date.now()
@@ -95,11 +160,13 @@ function allowWakeForThread(threadId, currentActiveUpdatedAt) {
         currentActiveUpdatedAt && globalLatched.activeUpdatedAt && currentActiveUpdatedAt !== globalLatched.activeUpdatedAt
       if (now < globalLatched.until && !humanTurnHappened) return false
       globalLatched = null
+      savePersistedCaps()
     }
     globalWakeHistory = globalWakeHistory.filter((ts) => ts >= cutoff)
     if (globalWakeHistory.length >= MAX_GLOBAL_WAKES) {
       globalLatched = { until: now + WAKE_COOLDOWN_MS, activeUpdatedAt: currentActiveUpdatedAt || '' }
       globalWakeHistory = []
+      savePersistedCaps()
       return false
     }
   }
@@ -114,12 +181,14 @@ function allowWakeForThread(threadId, currentActiveUpdatedAt) {
       return false
     }
     latchedThreads.delete(key)
+    savePersistedCaps()
   }
 
   const list = (wakeHistory.get(key) || []).filter((ts) => ts >= cutoff)
   if (list.length >= MAX_WAKES_PER_THREAD) {
     latchedThreads.set(key, { until: now + WAKE_COOLDOWN_MS, activeUpdatedAt: currentActiveUpdatedAt || '' })
     wakeHistory.set(key, [])
+    savePersistedCaps()
     return false
   }
   return true
@@ -138,16 +207,18 @@ function recordSuccessfulWake(threadId, currentActiveUpdatedAt) {
     }
   }
 
-  if (MAX_WAKES_PER_THREAD <= 0) return
-  const key = String(threadId ?? 0)
-  const list = (wakeHistory.get(key) || []).filter((ts) => ts >= cutoff)
-  list.push(now)
-  if (list.length >= MAX_WAKES_PER_THREAD) {
-    latchedThreads.set(key, { until: now + WAKE_COOLDOWN_MS, activeUpdatedAt: currentActiveUpdatedAt || '' })
-    wakeHistory.set(key, [])
-  } else {
-    wakeHistory.set(key, list)
+  if (MAX_WAKES_PER_THREAD > 0) {
+    const key = String(threadId ?? 0)
+    const list = (wakeHistory.get(key) || []).filter((ts) => ts >= cutoff)
+    list.push(now)
+    if (list.length >= MAX_WAKES_PER_THREAD) {
+      latchedThreads.set(key, { until: now + WAKE_COOLDOWN_MS, activeUpdatedAt: currentActiveUpdatedAt || '' })
+      wakeHistory.set(key, [])
+    } else {
+      wakeHistory.set(key, list)
+    }
   }
+  savePersistedCaps()
 }
 
 function resolveTargetConversation() {

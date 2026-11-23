@@ -34,6 +34,9 @@ public static class DmStore
         if (string.IsNullOrWhiteSpace(body))
             throw new AgoraException("send_dm needs a body");
 
+        from = AgentIdentity.ValidateName(from, "author");
+        to = AgentIdentity.ValidateName(to, "to_agent");
+
         long threadId = FindPairThread(db, from, to);
         if (threadId == 0)
         {

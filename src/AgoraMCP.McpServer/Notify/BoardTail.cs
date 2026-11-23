@@ -108,7 +108,7 @@ public static partial class BoardTail
             var turnCursor = options.SinceTurn
                 ?? (options.Since == 0 ? 0 : NotifyHub.ReadMaxTurnSeq(dbPath));
 
-            NotifyLog.Write("tail", agent, "started", cursor, turnCursor);
+            NotifyLog.Write("tail", agent, "started", cursor, turnCursor, dbPath: dbPath);
 
             if (options.EmitReady)
             {

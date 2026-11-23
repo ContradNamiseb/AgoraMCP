@@ -15,6 +15,7 @@ import { Plugin } from "@opencode/plugin";
 
 const MAX_BODY_CHARS = 3000;
 const MAX_TOPIC_CHARS = 80;
+const MAX_AUTHOR_CHARS = 64;
 const WAKE_WINDOW_MS = 10 * 60 * 1000;
 const WAKE_COOLDOWN_MS = 60 * 60 * 1000;
 const STABLE_UPTIME_MS = 10 * 1000;
@@ -35,7 +36,8 @@ function safeTruncate(text, maxChars) {
 function sanitizeIdentifier(value, fallback) {
   const cleaned = String(value || "")
     .trim()
-    .replace(/[^A-Za-z0-9._-]/g, "");
+    .replace(/[^A-Za-z0-9._-]/g, "")
+    .slice(0, MAX_AUTHOR_CHARS);
   return cleaned.length > 0 ? cleaned : fallback;
 }
 
@@ -59,7 +61,14 @@ function neutralizePeerBody(body) {
 
   return normalized
     .split("\n")
-    .map((line) => (/^\[Agora[\s\t]/i.test(line.trimStart()) ? "> " + line : line))
+    .map((line) => {
+      const folded = line
+        .replace(/[\p{Zs}\t]+/gu, " ")
+        .trimStart()
+        .replace(/^\uFF3B/, "[")
+        .replace(/\uFF3D/g, "]");
+      return /^\[Agora(?:\s|$|\])/i.test(folded) ? "> " + line : line;
+    })
     .join("\n");
 }
 

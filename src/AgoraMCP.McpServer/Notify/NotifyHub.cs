@@ -4,6 +4,7 @@ using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Threading.Channels;
 using AgoraMCP.Database;
 
 namespace AgoraMCP.McpServer.Notify;
@@ -60,7 +61,13 @@ public static class NotifyHub
     {
         public required string Agent { get; init; }
         public long Cursor;
-        public BlockingCollection<string> Queue { get; } = new(new ConcurrentQueue<string>(), MaxSubscriberQueue);
+        public Channel<string> Channel { get; } = System.Threading.Channels.Channel.CreateBounded<string>(
+            new BoundedChannelOptions(MaxSubscriberQueue)
+            {
+                FullMode = BoundedChannelFullMode.Wait,
+                SingleReader = true,
+                SingleWriter = false,
+            });
     }
 
     public static async Task<int> RunAsync(Options options, CancellationToken token)
@@ -93,14 +100,16 @@ public static class NotifyHub
             while (!token.IsCancellationRequested)
             {
                 var client = await listener.AcceptTcpClientAsync(token);
-                _ = HandleAsync(client, options, subscribers, token);
+                // Dispatch each connection asynchronously onto the thread pool so
+                // one SSE subscriber never stalls AcceptTcpClientAsync for later clients.
+                _ = Task.Run(() => HandleAsync(client, options, subscribers, token), token);
             }
         }
         catch (OperationCanceledException) { }
         finally
         {
             listener.Stop();
-            foreach (var sub in subscribers.Values) sub.Queue.CompleteAdding();
+            foreach (var sub in subscribers.Values) sub.Channel.Writer.TryComplete();
         }
         await pump;
         if (toast is not null) await toast.DisposeAsync();
@@ -187,7 +196,7 @@ public static class NotifyHub
                 subscribers[id] = sub;
                 foreach (var (replayLine, replaySeq, _, _, _) in ReadSince(options.DbPath, since, agent))
                 {
-                    if (!sub.Queue.TryAdd(replayLine)) break;
+                    if (!sub.Channel.Writer.TryWrite(replayLine)) break;
                     if (replaySeq > sub.Cursor) sub.Cursor = replaySeq;
                 }
                 await WriteRawAsync(stream,
@@ -198,18 +207,35 @@ public static class NotifyHub
                 while (!token.IsCancellationRequested)
                 {
                     string? item = null;
-                    try
+                    if (!sub.Channel.Reader.TryRead(out item))
                     {
-                        if (!sub.Queue.TryTake(out item, 15000, token)) item = null;
+                        var remaining = TimeSpan.FromSeconds(15) - (DateTime.UtcNow - lastPing);
+                        if (remaining <= TimeSpan.Zero) remaining = TimeSpan.FromMilliseconds(50);
+                        using var pingCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+                        pingCts.CancelAfter(remaining);
+                        try
+                        {
+                            if (await sub.Channel.Reader.WaitToReadAsync(pingCts.Token))
+                                sub.Channel.Reader.TryRead(out item);
+                            else
+                                break;
+                        }
+                        catch (OperationCanceledException) when (!token.IsCancellationRequested)
+                        {
+                            item = null;
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            break;
+                        }
                     }
-                    catch (OperationCanceledException) { break; }
                     try
                     {
                         if (item is not null)
                         {
                             await writer.WriteAsync($"data: {item}\n\n");
                         }
-                        else if (DateTime.UtcNow - lastPing > TimeSpan.FromSeconds(15))
+                        else if (DateTime.UtcNow - lastPing >= TimeSpan.FromSeconds(15))
                         {
                             await writer.WriteAsync(":ping\n\n");
                             lastPing = DateTime.UtcNow;
@@ -226,7 +252,7 @@ public static class NotifyHub
                     }
                 }
                 subscribers.TryRemove(id, out _);
-                sub.Queue.CompleteAdding();
+                sub.Channel.Writer.TryComplete();
             }
         }
         catch (Exception e) when (e is IOException or SocketException or ObjectDisposedException or OperationCanceledException)
@@ -326,6 +352,7 @@ public static class NotifyHub
                     ? toastCursor
                     : Math.Min(toastCursor, subscribers.Values.Min(s => s.Cursor));
                 var rows = ReadSince(options.DbPath, floor, "");
+                var fullThisTick = new HashSet<Guid>();
                 foreach (var (line, seq, to, author, topic) in rows)
                 {
                     // One toast per genuinely new DIRECTED row, regardless of
@@ -337,12 +364,21 @@ public static class NotifyHub
                     {
                         _ = toast.ShowAsync($"Agora → {to}", $"{author}: {topic}");
                     }
-                    foreach (var sub in subscribers.Values)
+                    foreach (var (subId, sub) in subscribers)
                     {
+                        if (fullThisTick.Contains(subId)) continue;
                         if (seq <= sub.Cursor) continue;
                         if (sub.Agent.Length > 0 && to.Length > 0 && !AgentIdentity.AnswersTo(sub.Agent, to)) continue;
-                        if (sub.Queue.TryAdd(line))
+                        if (sub.Channel.Writer.TryWrite(line))
+                        {
                             sub.Cursor = seq;
+                        }
+                        else
+                        {
+                            // Stop enqueueing for this subscriber for the rest of this tick
+                            // so a slot freeing mid-tick cannot let row N+1 overtake row N.
+                            fullThisTick.Add(subId);
+                        }
                     }
                 }
                 if (rows.Count > 0) toastCursor = rows[^1].Seq;
